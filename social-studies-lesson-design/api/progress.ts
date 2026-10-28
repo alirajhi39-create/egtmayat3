@@ -3,7 +3,6 @@ import { neon } from "@neondatabase/serverless";
 /**
  * واجهة برمجية واحدة لإدارة تقدم الطلاب.
  * متغير البيئة المطلوب على Vercel:  DATABASE_URL  (رابط Neon)
- * اختياري: TEACHER_PIN (رمز دخول لوحة المعلم، الافتراضي 1234)
  */
 
 const sqlClient = () => {

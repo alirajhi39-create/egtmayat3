@@ -6,7 +6,8 @@ import { QuizSlide, FinaleSlide } from "./components/Quiz";
 import { StudentLogin } from "./components/StudentLogin";
 import { TeacherDashboard } from "./components/TeacherDashboard";
 import { SlideContext } from "./components/Shared";
-import { playClick, stopSpeaking } from "./utils/audio";
+import { playClick, playSuccess, stopAllAudio } from "./utils/audio";
+import { refreshKeys, warmSounds } from "./utils/soundStore";
 import { getSession, updateProgress, endSession } from "./lib/progress";
 
 const SLIDE_TITLES = [
@@ -42,8 +43,26 @@ export default function App() {
     if (view === "lesson") updateProgress({ maxSlide: slide, totalSlides });
   }, [slide, view, totalSlides]);
 
+  useEffect(() => {
+    if (view !== "lesson") return;
+    if (slide === 13 && !finished) return; // الاختبار يهيئ السؤال الحالي والتالي بنفسه
+    warmSounds(finished
+      ? ["voice-slide-14", "sfx-click"]
+      : [`voice-slide-${slide}`, `voice-slide-${slide + 1}`, "sfx-click"]);
+  }, [slide, finished, view]);
+
+  useEffect(() => {
+    const sync = () => { void refreshKeys(); };
+    window.addEventListener("focus", sync);
+    const timer = window.setInterval(sync, 30000);
+    return () => {
+      window.removeEventListener("focus", sync);
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const go = (n: number) => {
-    stopSpeaking();
+    stopAllAudio();
     playClick();
     setFinished(false);
     setSlide(Math.max(0, Math.min(totalSlides - 1, n)));
@@ -51,14 +70,15 @@ export default function App() {
   };
 
   const handleQuizFinish = (score: number) => {
-    stopSpeaking();
+    stopAllAudio();
     setFinalScore(score);
     setFinished(true);
+    playSuccess();
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const restart = () => {
-    stopSpeaking();
+    stopAllAudio();
     playClick();
     setFinished(false);
     setSlide(0);
@@ -66,7 +86,7 @@ export default function App() {
   };
 
   const logout = () => {
-    stopSpeaking();
+    stopAllAudio();
     endSession();
     setStudent(null);
     setSlide(0);
@@ -78,12 +98,12 @@ export default function App() {
     return (
       <StudentLogin
         onStart={() => { setStudent(getSession()); setSlide(0); setFinished(false); setView("lesson"); }}
-        onTeacher={() => setView("teacher")}
+        onTeacher={() => { stopAllAudio(); setView("teacher"); }}
       />
     );
 
   if (view === "teacher")
-    return <TeacherDashboard onExit={() => setView(getSession() ? "lesson" : "login")} />;
+    return <TeacherDashboard onExit={() => { stopAllAudio(); setView(getSession() ? "lesson" : "login"); }} />;
 
   const renderSlide = () => {
     if (finished) return <FinaleSlide score={finalScore} total={QUIZ_TOTAL} onRestart={restart} />;
@@ -129,7 +149,7 @@ export default function App() {
               <span className="rounded-full bg-white/15 px-2.5 sm:px-3 py-1">
                 {finished ? "النتيجة" : `${slide + 1}/${totalSlides}`}
               </span>
-              <button onClick={() => setView("teacher")} className="rounded-full bg-white/15 hover:bg-white/25 px-2.5 sm:px-3 py-1" title="لوحة المعلم">
+              <button onClick={() => { stopAllAudio(); setView("teacher"); }} className="rounded-full bg-white/15 hover:bg-white/25 px-2.5 sm:px-3 py-1" title="لوحة المعلم">
                 👨‍🏫
               </button>
               <button onClick={logout} className="rounded-full bg-white/15 hover:bg-rose-500 px-2.5 sm:px-3 py-1" title="إنهاء الجلسة">

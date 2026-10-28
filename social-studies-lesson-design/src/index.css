@@ -35,6 +35,27 @@ body {
   animation: shake 0.45s ease-in-out;
 }
 
+/* ===== الطباعة / حفظ PDF ===== */
+@page {
+  size: A4;
+  margin: 12mm;
+}
+
+@media print {
+  html,
+  body {
+    background: #fff !important;
+  }
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .avoid-break {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}
+
 /* شريط تمرير أنيق لخريطة الدرس */
 nav::-webkit-scrollbar {
   height: 6px;
@@ -42,61 +63,4 @@ nav::-webkit-scrollbar {
 nav::-webkit-scrollbar-thumb {
   background: #99f6e4;
   border-radius: 9999px;
-}
-
-/* تنسيقات الطباعة وتصدير PDF */
-.print-only {
-  display: none;
-}
-
-@media print {
-  body {
-    background: #ffffff !important;
-    color: #0f172a !important;
-    font-size: 11pt;
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }
-
-  /* إخفاء عناصر التحكم والأزرار ورأس الصفحة الإلكتروني عند الطباعة */
-  header,
-  nav,
-  footer,
-  button,
-  input,
-  .no-print {
-    display: none !important;
-  }
-
-  /* إظهار تقرير الطباعة الرسمي فقط */
-  .print-only {
-    display: block !important;
-  }
-
-  /* تنسيق الجداول والصفحات */
-  table {
-    border-collapse: collapse !important;
-    width: 100% !important;
-  }
-
-  th,
-  td {
-    border: 1px solid #94a3b8 !important;
-    padding: 6px 8px !important;
-    font-size: 10pt;
-  }
-
-  thead {
-    display: table-header-group;
-    background-color: #f1f5f9 !important;
-  }
-
-  tr {
-    page-break-inside: avoid;
-  }
-
-  @page {
-    size: A4 portrait;
-    margin: 12mm 10mm;
-  }
 }

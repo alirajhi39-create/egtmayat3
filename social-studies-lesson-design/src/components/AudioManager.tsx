@@ -3,7 +3,6 @@ import {
   putSound,
   deleteSound,
   listSoundKeys,
-  playCustom,
   refreshKeys,
   isCloud,
   isCloudOnline,
@@ -12,7 +11,7 @@ import {
   syncLocalToCloud,
   onSoundsChanged,
 } from "../utils/soundStore";
-import { playClick, playCorrect, playWrong, playSuccess, playFlip, playReveal, speak } from "../utils/audio";
+import { playClick, playCorrect, playWrong, playSuccess, playFlip, playReveal, speak, previewSound, stopAllAudio } from "../utils/audio";
 import { QUESTIONS } from "./Quiz";
 
 const SFX = [
@@ -55,11 +54,15 @@ export function AudioManager() {
   useEffect(() => {
     void reload();
     const off = onSoundsChanged(() => setSeed((s) => s + 1));
-    return off;
+    return () => {
+      off();
+      stopAllAudio();
+    };
   }, []);
 
   const upload = async (key: string, file: File | undefined) => {
     if (!file) return;
+    stopAllAudio();
     setBusy(key);
     setMessage(null);
     try {
@@ -109,7 +112,7 @@ export function AudioManager() {
           {inCloud ? "☁️ على كل الأجهزة" : local ? "📱 هذا الجهاز فقط" : "الصوت الافتراضي"}
         </span>
         <button
-          onClick={() => (has ? void playCustom(k) : preview?.())}
+          onClick={() => (has ? previewSound(k) : preview?.())}
           className="rounded-lg bg-slate-100 hover:bg-slate-200 px-3 py-1.5 text-sm font-bold"
         >
           ▶️ تجربة
@@ -122,6 +125,7 @@ export function AudioManager() {
           <button
             onClick={async () => {
               if (!confirm("حذف هذا الملف من كل الأجهزة؟")) return;
+              stopAllAudio();
               await deleteSound(k);
               await reload();
               setMessage({ type: "ok", text: "تم حذف الملف من السحابة وهذا الجهاز." });

@@ -50,7 +50,7 @@ export function SpeakButton({
 
   useEffect(() => {
     return () => stopSpeaking();
-  }, []);
+  }, [slide, variant]);
 
   const toggle = () => {
     playClick();

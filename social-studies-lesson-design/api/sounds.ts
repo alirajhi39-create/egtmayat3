@@ -82,11 +82,12 @@ export default async function handler(req: any, res: any) {
 
   try {
     const sql = sqlClient();
-    await ensureTable(sql);
 
     /* ========= رفع ملف ========= */
     if (req.method === "POST") {
       if (!key) return res.status(400).json({ ok: false, error: "المفتاح مطلوب" });
+      // يُنشأ الجدول عند أول رفع فقط؛ القراءات اللاحقة لا تحتاج استعلام إنشاء.
+      await ensureTable(sql);
 
       const buf = await readRaw(req);
 
@@ -134,8 +135,36 @@ export default async function handler(req: any, res: any) {
       if (!rows.length) return res.status(404).json({ ok: false, error: "غير موجود" });
       const buf = toBuffer(rows[0].data);
       res.setHeader("Content-Type", rows[0].mime || "audio/mpeg");
+      res.setHeader("Accept-Ranges", "bytes");
+
+      // يختلف الرابط بعد استبدال الملف (v=updatedAt)، فتُخزَّن النسخة الجديدة مستقلة.
+      if (req.query?.v) {
+        res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=86400, immutable");
+      } else {
+        res.setHeader("Cache-Control", "no-store");
+      }
+
+      // بعض متصفحات الجوال تتطلب 206 لتشغيل الصوت مباشرة من الشبكة.
+      const range = String(req.headers.range || "");
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (range && !match) {
+        res.setHeader("Content-Range", `bytes */${buf.length}`);
+        return res.status(416).end();
+      }
+      if (match) {
+        const start = match[1] ? Number(match[1]) : Math.max(0, buf.length - Number(match[2]));
+        const end = match[1] ? (match[2] ? Number(match[2]) : buf.length - 1) : buf.length - 1;
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= buf.length || end < start) {
+          res.setHeader("Content-Range", `bytes */${buf.length}`);
+          return res.status(416).end();
+        }
+        const chunk = buf.subarray(start, Math.min(end, buf.length - 1) + 1);
+        res.setHeader("Content-Range", `bytes ${start}-${start + chunk.length - 1}/${buf.length}`);
+        res.setHeader("Content-Length", String(chunk.length));
+        return res.status(206).send(chunk);
+      }
+
       res.setHeader("Content-Length", String(buf.length));
-      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       return res.status(200).send(buf);
     }
 
@@ -146,6 +175,7 @@ export default async function handler(req: any, res: any) {
       ORDER BY updated_at DESC
       LIMIT 500;
     `;
+    res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       maxBytes: MAX_SOUND_BYTES,
@@ -158,6 +188,13 @@ export default async function handler(req: any, res: any) {
       })),
     });
   } catch (err: any) {
+    // قبل رفع أول ملف لا يوجد جدول بعد؛ الواجهة ترى قائمة فارغة بدلاً من خطأ.
+    if (err?.code === "42P01") {
+      if (key && req.method !== "DELETE") return res.status(404).json({ ok: false, error: "غير موجود" });
+      if (req.method === "DELETE") return res.status(200).json({ ok: true });
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({ ok: true, maxBytes: MAX_SOUND_BYTES, sounds: [] });
+    }
     return res.status(500).json({ ok: false, error: err?.message || "خطأ في الخادم" });
   }
 }

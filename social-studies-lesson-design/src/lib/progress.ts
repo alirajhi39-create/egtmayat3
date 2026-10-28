@@ -143,18 +143,24 @@ export async function fetchStudents(): Promise<{ students: StudentProgress[]; so
   }
 }
 
-export async function deleteStudentRemote(id: string) {
+/** حذف طالب واحد من قاعدة البيانات ومن التخزين المحلي */
+export async function deleteStudent(id: string): Promise<boolean> {
+  let ok = true;
   try {
-    await fetch(`/api/progress?id=${encodeURIComponent(id)}`, { method: "DELETE" });
-  } catch {}
-  deleteLocal(id);
-}
-
-export function deleteLocal(id: string) {
+    const res = await fetch(`/api/progress?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+    ok = res.ok;
+  } catch {
+    ok = false; // لا يوجد اتصال بالخادم — نحذف المحلي فقط
+  }
   try {
-    const all = readLocal().filter((x) => x.id !== id);
-    localStorage.setItem(LS_LOCAL_DB, JSON.stringify(all));
+    localStorage.setItem(LS_LOCAL_DB, JSON.stringify(readLocal().filter((s) => s.id !== id)));
   } catch {}
+  // إذا كان المحذوف هو جلسة هذا الجهاز نُنهيها حتى لا يُعاد إنشاؤه تلقائياً
+  if (getSession()?.id === id) {
+    if (timer) clearTimeout(timer);
+    endSession();
+  }
+  return ok;
 }
 
 export async function deleteAllRemote() {

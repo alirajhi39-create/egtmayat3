@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { StrategyBadge, SpeakButton, SectionTitle, SlideCard } from "./Shared";
-import { playCorrect, playWrong, playSuccess, playClick } from "../utils/audio";
+import { playCorrect, playWrong, playClick, stopAllAudio } from "../utils/audio";
 import { recordActivity, updateProgress } from "../lib/progress";
+import { warmSounds } from "../utils/soundStore";
 
 type Q = { q: string; options: string[]; answer: number; explain: string };
 
@@ -64,6 +65,14 @@ export function QuizSlide({ onFinish }: { onFinish: (score: number) => void }) {
 
   const q = QUESTIONS[current];
 
+  useEffect(() => {
+    warmSounds([
+      `voice-slide-13-q${current + 1}`,
+      ...(current + 1 < QUESTIONS.length ? [`voice-slide-13-q${current + 2}`] : []),
+      "sfx-click",
+    ]);
+  }, [current]);
+
   const choose = (i: number) => {
     if (answered) return;
     setSelected(i);
@@ -79,13 +88,13 @@ export function QuizSlide({ onFinish }: { onFinish: (score: number) => void }) {
   };
 
   const next = () => {
+    stopAllAudio();
     playClick();
     if (current + 1 < QUESTIONS.length) {
       setCurrent((c) => c + 1);
       setSelected(null);
       setAnswered(false);
     } else {
-      playSuccess();
       updateProgress({ quizScore: score, quizTotal: QUESTIONS.length });
       onFinish(score);
     }
@@ -154,7 +163,7 @@ export function QuizSlide({ onFinish }: { onFinish: (score: number) => void }) {
             {current + 1 < QUESTIONS.length ? "السؤال التالي ←" : "🏁 عرض النتيجة النهائية"}
           </button>
         )}
-        <SpeakButton label="استمع للسؤال" variant={`q${current + 1}`} text={`السؤال ${current + 1}: ${q.q} الخيارات هي: ${q.options.join("، ")}`} />
+        <SpeakButton key={current} label="استمع للسؤال" variant={`q${current + 1}`} text={`السؤال ${current + 1}: ${q.q} الخيارات هي: ${q.options.join("، ")}`} />
       </div>
     </SlideCard>
   );
