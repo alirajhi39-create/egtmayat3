@@ -1,4 +1,4 @@
-import { hasCustom, playCustom } from "./soundStore";
+import { hasCustom, playCustom, getSoundURL } from "./soundStore";
 
 // ==== المؤثرات الصوتية باستخدام Web Audio API ====
 let ctx: AudioContext | null = null;
@@ -108,22 +108,9 @@ function pickArabicVoice(): SpeechSynthesisVoice | null {
 }
 
 let currentAudio: HTMLAudioElement | null = null;
+let playToken = 0;
 
-/**
- * قراءة نص بصوت عربي، أو تشغيل ملف تعليق صوتي مسجل من المعلم إذا توفر
- * تحت المفتاح narrationKey (مثل "voice-slide-3").
- */
-export function speak(text: string, onEnd?: () => void, narrationKey?: string) {
-  stopSpeaking();
-  if (narrationKey && hasCustom(narrationKey)) {
-    void playCustom(narrationKey, () => {
-      currentAudio = null;
-      onEnd?.();
-    }).then((a) => {
-      currentAudio = a;
-    });
-    return;
-  }
+function speakTTS(text: string, onEnd?: () => void) {
   try {
     const synth = window.speechSynthesis;
     synth.cancel();
@@ -148,8 +135,46 @@ export function speak(text: string, onEnd?: () => void, narrationKey?: string) {
   }
 }
 
+/**
+ * قراءة نص بصوت عربي، أو تشغيل ملف تعليق صوتي (محلي أو من السحابة)
+ * إذا وُجد تحت المفتاح narrationKey مثل "voice-slide-13-q3".
+ * إن لم يوجد ملف مخصص، تُستخدم القراءة الآلية تلقائياً.
+ */
+export function speak(text: string, onEnd?: () => void, narrationKey?: string) {
+  stopSpeaking();
+  const token = ++playToken;
+
+  if (narrationKey) {
+    void getSoundURL(narrationKey).then((url) => {
+      if (token !== playToken) return; // أُلغي الطلب أو تنقّل المستخدم
+      if (!url) {
+        speakTTS(text, onEnd);
+        return;
+      }
+      const audio = new Audio(url);
+      currentAudio = audio;
+      audio.onended = () => {
+        currentAudio = null;
+        onEnd?.();
+      };
+      audio.onerror = () => {
+        currentAudio = null;
+        speakTTS(text, onEnd);
+      };
+      void audio.play().catch(() => {
+        currentAudio = null;
+        speakTTS(text, onEnd);
+      });
+    });
+    return;
+  }
+
+  speakTTS(text, onEnd);
+}
+
 /** إيقاف أي قراءة أو ملف تعليق جارٍ */
 export function stopSpeaking() {
+  playToken++;
   try {
     if (currentAudio) {
       currentAudio.pause();
