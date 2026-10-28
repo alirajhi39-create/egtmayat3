@@ -143,6 +143,20 @@ export async function fetchStudents(): Promise<{ students: StudentProgress[]; so
   }
 }
 
+export async function deleteStudentRemote(id: string) {
+  try {
+    await fetch(`/api/progress?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch {}
+  deleteLocal(id);
+}
+
+export function deleteLocal(id: string) {
+  try {
+    const all = readLocal().filter((x) => x.id !== id);
+    localStorage.setItem(LS_LOCAL_DB, JSON.stringify(all));
+  } catch {}
+}
+
 export async function deleteAllRemote() {
   try {
     await fetch("/api/progress", { method: "DELETE" });
