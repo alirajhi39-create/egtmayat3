@@ -26,6 +26,7 @@ test("rollback restores the original class label without changing student work",
             globalThis.__progressQueries.push(query);
             if (query.includes("CREATE TABLE")) return [];
             if (query.includes("SET class_name = CASE")) {
+              if (globalThis.__failMigration) throw Object.assign(new Error("migration denied"), { code: "42501" });
               if (row.class_name === "6 / أ") row.class_name = "٦/١";
               if (row.class_name === "6 / ب") row.class_name = "٦/٢";
               return [];
@@ -133,6 +134,26 @@ test("rollback restores the original class label without changing student work",
   assert.equal(secondRow.class_name, "٦/٢");
   assert.equal(secondRow.quiz_score, 5);
   assert.deepEqual(secondRow.activities, { "نشاط٣": "إجابة محفوظة" });
+
+  const missingConnection = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  const { default: missingHandler } = await import(`data:text/javascript;base64,${source}#missing-url`);
+  const missing = response();
+  await missingHandler({ method: "GET", query: {} }, missing);
+  assert.equal(missing.code, 503);
+  assert.equal(missing.body.code, "DATABASE_URL_MISSING");
+  process.env.DATABASE_URL = missingConnection;
+
+  const oldRow = { ...row, id: "readable-old-student", class_name: "6 / أ" };
+  globalThis.__progressRow = oldRow;
+  globalThis.__failMigration = true;
+  const { default: readableHandler } = await import(`data:text/javascript;base64,${source}#migration-denied`);
+  const readable = response();
+  await readableHandler({ method: "GET", query: {} }, readable);
+  assert.equal(readable.code, 200);
+  assert.equal(readable.body.students[0].class_name, "٦/١");
+  assert.equal(oldRow.activities["نشاط١"], "إجابة سابقة");
+  globalThis.__failMigration = false;
 });
 
 test("backup restores only missing IDs and updates the student session name", async () => {
@@ -204,6 +225,12 @@ test("backup restores only missing IDs and updates the student session name", as
   await assert.rejects(progress.renameStudent(session.id, "اسم لن يحفظ"), /تعذر الحفظ/);
   assert.equal(progress.getSession().studentName, "اسم جديد من اللوحة");
   assert.equal(progress.getSession().className, "٦/٢");
+
+  globalThis.fetch = async () => ({ ok: false, status: 503, json: async () => ({ ok: false, error: "DATABASE_URL غير متاح في Production" }) });
+  const disconnected = await progress.fetchStudents();
+  assert.equal(disconnected.source, "local");
+  assert.match(disconnected.error, /DATABASE_URL/);
+  assert.ok(disconnected.students.some((student) => student.id === session.id));
 });
 
 test("class labels from the previous deployment normalize back to the original choices", async () => {

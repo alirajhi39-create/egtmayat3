@@ -18,6 +18,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   const [tab, setTab] = useState<"students" | "audio">("students");
   const [students, setStudents] = useState<StudentProgress[]>([]);
   const [source, setSource] = useState<"neon" | "local">("local");
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("");
   const [open, setOpen] = useState<string | null>(null);
@@ -42,6 +43,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
     if (version === loadVersion.current) {
       setStudents(r.students);
       setSource(r.source);
+      setConnectionError(r.error || null);
     }
     setLoading(false);
   };
@@ -303,7 +305,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
 
             {!loading && source === "local" && (
               <p className="text-sm font-bold text-amber-900 bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 mb-4">
-                لا يوجد اتصال بقاعدة Neon حالياً. إن كانت هناك سجلات سابقة فتأكد من متغير DATABASE_URL لبيئة Production قبل إدخال بيانات جديدة.
+                تعذر جلب سجلات Neon: {connectionError || "تحقق من اتصال قاعدة البيانات."} تأكد أن DATABASE_URL في بيئة Production يشير إلى قاعدة بيانات الطلاب القديمة، ثم اضغط تحديث.
               </p>
             )}
 

@@ -8,7 +8,7 @@ import { normalizeClassName } from "../src/lib/classes";
 
 const sqlClient = () => {
   const url = process.env.DATABASE_URL;
-  if (!url) throw new Error("DATABASE_URL غير معرّف");
+  if (!url) throw Object.assign(new Error("DATABASE_URL غير معرّف"), { code: "DATABASE_URL_MISSING" });
   return neon(url);
 };
 
@@ -32,20 +32,25 @@ function ensureTable(sql: any) {
         );
       `;
       // إرجاع تسميات الفصل إلى ٦/١ و٦/٢. لا يتغير أي حقل آخر في سجلات الطلاب.
-      await sql`
-        UPDATE lesson_progress
-        SET class_name = CASE
-          WHEN replace(class_name, ' ', '') IN ('6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١')
-            THEN '٦/١'
-          ELSE '٦/٢'
-        END
-        WHERE lesson_slug = 'saudi-state-2'
-          AND class_name NOT IN ('٦/١', '٦/٢')
-          AND replace(class_name, ' ', '') IN (
-            '6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١', '٦/١',
-            '6/ب', '٦/ب', '6/2', '٦/2', '6/٢', '٦/٢'
-          );
-      `;
+      try {
+        await sql`
+          UPDATE lesson_progress
+          SET class_name = CASE
+            WHEN replace(class_name, ' ', '') IN ('6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١')
+              THEN '٦/١'
+            ELSE '٦/٢'
+          END
+          WHERE lesson_slug = 'saudi-state-2'
+            AND class_name NOT IN ('٦/١', '٦/٢')
+            AND replace(class_name, ' ', '') IN (
+              '6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١', '٦/١',
+              '6/ب', '٦/ب', '6/2', '٦/2', '6/٢', '٦/٢'
+            );
+        `;
+      } catch (error) {
+        // فشل تغيير اسم الفصل لا يجوز أن يحجب السجلات والإجابات الموجودة.
+        console.error("Class label migration could not run", error instanceof Error ? error.message : "unknown error");
+      }
     })().catch((error) => {
       tableReady = null;
       throw error;
@@ -192,6 +197,14 @@ export default async function handler(req: any, res: any) {
       students: rows.map((row: any) => ({ ...row, class_name: normalizeClassName(row.class_name) })),
     });
   } catch (err: any) {
-    return res.status(500).json({ ok: false, error: err?.message || "خطأ في الخادم" });
+    console.error("Neon progress request failed", err?.code || "", err?.message || "unknown error");
+    const missingUrl = err?.code === "DATABASE_URL_MISSING";
+    return res.status(missingUrl ? 503 : 500).json({
+      ok: false,
+      code: missingUrl ? "DATABASE_URL_MISSING" : "NEON_REQUEST_FAILED",
+      error: missingUrl
+        ? "متغير DATABASE_URL غير موجود في إعدادات Vercel لهذا النشر. اربط قاعدة Neon ببيئة Production ثم أعد النشر."
+        : "تعذر قراءة قاعدة Neon. تحقق من اتصال DATABASE_URL بقاعدة الإنتاج السابقة وراجع سجلات Functions في Vercel.",
+    });
   }
 }

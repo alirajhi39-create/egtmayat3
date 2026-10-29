@@ -188,12 +188,19 @@ export function clearLocal() {
 }
 
 /* ============ جلب بيانات لوحة المعلم ============ */
-export async function fetchStudents(): Promise<{ students: StudentProgress[]; source: "neon" | "local" }> {
+export async function fetchStudents(): Promise<{ students: StudentProgress[]; source: "neon" | "local"; error?: string }> {
   try {
-    const res = await fetch("/api/progress");
-    if (!res.ok) throw new Error();
-    const data = await res.json();
-    const students: StudentProgress[] = (data.students || []).map((r: any) => ({
+    const res = await fetch("/api/progress", { cache: "no-store" });
+    let data: any;
+    try {
+      data = await res.json();
+    } catch {
+      throw new Error("واجهة /api/progress لا تُرجع JSON. تحقق من نشر دوال Vercel الخاصة بالمشروع.");
+    }
+    if (!res.ok || !data.ok || !Array.isArray(data.students)) {
+      throw new Error(data.error || `تعذر جلب بيانات Neon (رمز HTTP ${res.status}).`);
+    }
+    const students: StudentProgress[] = data.students.map((r: any) => ({
       id: r.id,
       studentName: r.student_name,
       className: normalizeClassName(r.class_name),
@@ -206,8 +213,12 @@ export async function fetchStudents(): Promise<{ students: StudentProgress[]; so
       updatedAt: r.updated_at,
     }));
     return { students, source: "neon" };
-  } catch {
-    return { students: readLocal().sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)), source: "local" };
+  } catch (error) {
+    return {
+      students: readLocal().sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)),
+      source: "local",
+      error: error instanceof Error ? error.message : "تعذر الوصول إلى قاعدة Neon.",
+    };
   }
 }
 
