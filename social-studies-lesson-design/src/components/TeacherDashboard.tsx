@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  fetchStudents, deleteAllRemote, deleteStudent, renameStudent, toCSV,
+  fetchStudents, deleteAllRemote, deleteStudent, updateStudentDetails, toCSV,
   makeBackup, parseBackup, localOnlyStudents, restoreMissingStudents,
   type StudentProgress,
 } from "../lib/progress";
+import { CLASSES, isClassName, normalizeClassName } from "../lib/classes";
 import { PrintReport } from "./PrintReport";
 import { AudioManager } from "./AudioManager";
 import { playClick } from "../utils/audio";
@@ -29,8 +30,9 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   const [notice, setNotice] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [nameDraft, setNameDraft] = useState("");
-  const [nameError, setNameError] = useState("");
-  const [savingName, setSavingName] = useState(false);
+  const [classDraft, setClassDraft] = useState("");
+  const [editError, setEditError] = useState("");
+  const [savingDetails, setSavingDetails] = useState(false);
   const [backupBusy, setBackupBusy] = useState(false);
   const loadVersion = useRef(0);
 
@@ -58,11 +60,6 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
         (s) => (s.studentName + s.className).includes(filter.trim()) && (!classFilter || s.className === classFilter)
       ),
     [students, filter, classFilter]
-  );
-
-  const classes = useMemo(
-    () => Array.from(new Set(students.map((s) => s.className).filter(Boolean))).sort(),
-    [students]
   );
 
   const localOnlyCount = useMemo(() => source === "neon" ? localOnlyStudents(students).length : 0, [students, source]);
@@ -162,27 +159,37 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
     setTimeout(() => setNotice(null), 4000);
   };
 
-  const saveName = async (event: React.FormEvent<HTMLFormElement>, student: StudentProgress) => {
+  const saveDetails = async (event: React.FormEvent<HTMLFormElement>, student: StudentProgress) => {
     event.preventDefault();
     const name = nameDraft.replace(/\s+/g, " ").trim();
+    const className = normalizeClassName(classDraft);
     if (name.length < 3 || name.length > 100) {
-      setNameError("اكتب اسماً صحيحاً من ٣ إلى ١٠٠ حرف");
+      setEditError("اكتب اسماً صحيحاً من ٣ إلى ١٠٠ حرف");
       return;
     }
-    if (name === student.studentName) { setEditingId(null); return; }
-    setSavingName(true);
-    setNameError("");
+    if (!isClassName(className)) {
+      setEditError("اختر الفصل 6 / أ أو 6 / ب");
+      return;
+    }
+    const changes: { studentName?: string; className?: string } = {};
+    if (name !== student.studentName) changes.studentName = name;
+    if (className !== normalizeClassName(student.className)) changes.className = className;
+    if (!Object.keys(changes).length) { setEditingId(null); return; }
+    setSavingDetails(true);
+    setEditError("");
     try {
-      const savedName = await renameStudent(student.id, name);
+      const saved = await updateStudentDetails(student.id, changes);
       loadVersion.current++;
-      setStudents((rows) => rows.map((row) => row.id === student.id ? { ...row, studentName: savedName } : row));
+      setStudents((rows) => rows.map((row) => row.id === student.id
+        ? { ...row, studentName: saved.studentName, className: saved.className ?? className }
+        : row));
       setEditingId(null);
-      setNotice({ type: "ok", text: `حُفظ اسم الطالب «${savedName}» دون تغيير تقدمه أو إجاباته.` });
+      setNotice({ type: "ok", text: `حُفظت بيانات الطالب «${saved.studentName}» في الفصل «${saved.className ?? className}» دون تغيير تقدمه أو إجاباته.` });
       void load();
     } catch (error) {
-      setNameError(error instanceof Error ? error.message : "تعذر حفظ الاسم. حاول مرة أخرى.");
+      setEditError(error instanceof Error ? error.message : "تعذر حفظ بيانات الطالب. حاول مرة أخرى.");
     } finally {
-      setSavingName(false);
+      setSavingDetails(false);
     }
   };
 
@@ -307,7 +314,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
 
             {!loading && source === "local" && (
               <p className="text-sm font-bold text-amber-900 bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 mb-4">
-                تعديل أسماء الطلاب وحفظها بين الأجهزة وبعد النشر يتطلب اتصال قاعدة بيانات Neon.
+                تعديل أسماء الطلاب وفصولهم وحفظها بين الأجهزة وبعد النشر يتطلب اتصال قاعدة بيانات Neon.
               </p>
             )}
 
@@ -406,7 +413,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
             {/* مرشح الفصل + خيارات محتوى التقرير */}
             <div className="flex flex-wrap items-center gap-2 mb-4">
               <span className="font-extrabold text-slate-500 text-sm">الفصل:</span>
-              {["", ...classes].map((c) => (
+              {["", ...CLASSES].map((c) => (
                 <button
                   key={c || "all"}
                   onClick={() => setClassFilter(c)}
@@ -414,7 +421,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                     classFilter === c ? "bg-teal-700 border-teal-700 text-white" : "bg-white border-slate-300 text-slate-600 hover:border-teal-400"
                   }`}
                 >
-                  {c || "الكل"}
+                  {c ? <bdi dir="ltr">{c}</bdi> : "الكل"}
                 </button>
               ))}
               <div className="mr-auto flex flex-wrap items-center gap-x-4 gap-y-1">
@@ -472,7 +479,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                           <div className="flex-1 min-w-36">
                             <p className="font-extrabold text-slate-800">{s.studentName}</p>
                             <p className="text-slate-500 font-bold text-xs">
-                              الفصل {s.className || "—"} • آخر نشاط: {new Date(s.updatedAt).toLocaleString("ar-SA")}
+                              الفصل <bdi dir="ltr">{s.className || "—"}</bdi> • آخر نشاط: {new Date(s.updatedAt).toLocaleString("ar-SA")}
                             </p>
                           </div>
                           <div className="w-full sm:w-40 order-last sm:order-none">
@@ -501,13 +508,14 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                             onClick={() => {
                               setEditingId(s.id);
                               setNameDraft(s.studentName);
-                              setNameError("");
+                              setClassDraft(isClassName(normalizeClassName(s.className)) ? normalizeClassName(s.className) : "");
+                              setEditError("");
                             }}
                             disabled={source !== "neon"}
-                            title={source === "neon" ? "تعديل اسم الطالب" : "يتطلب اتصال قاعدة بيانات Neon"}
+                            title={source === "neon" ? "تعديل اسم الطالب وفصله" : "يتطلب اتصال قاعدة بيانات Neon"}
                             className="rounded-lg bg-teal-100 hover:bg-teal-200 text-teal-800 px-3 py-2 text-sm font-extrabold disabled:opacity-50 disabled:cursor-not-allowed"
                           >
-                            تعديل الاسم
+                            تعديل الاسم والفصل
                           </button>
                           <button
                             onClick={() => startPrint([s], `تقرير الطالب ${s.studentName}`)}
@@ -533,24 +541,36 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                         </div>
                       </div>
                       {editingId === s.id && (
-                        <form onSubmit={(event) => void saveName(event, s)} className="border-t border-teal-200 bg-teal-50 p-4 flex flex-wrap items-end gap-3">
+                        <form onSubmit={(event) => void saveDetails(event, s)} className="border-t border-teal-200 bg-teal-50 p-4 flex flex-wrap items-end gap-3">
                           <label className="flex-1 min-w-48 font-extrabold text-teal-900 text-sm">
                             الاسم الجديد للطالب
                             <input
                               autoFocus
                               maxLength={100}
                               value={nameDraft}
-                              onChange={(event) => { setNameDraft(event.target.value); setNameError(""); }}
+                              onChange={(event) => { setNameDraft(event.target.value); setEditError(""); }}
                               className="block w-full mt-1 rounded-lg border-2 border-teal-300 bg-white px-3 py-2.5 font-bold focus:border-teal-600 focus:outline-none"
                             />
                           </label>
-                          <button type="submit" disabled={savingName} className="rounded-lg bg-teal-700 text-white px-5 py-2.5 font-extrabold disabled:opacity-50">
-                            {savingName ? "جارٍ الحفظ..." : "حفظ الاسم"}
+                          <label className="font-extrabold text-teal-900 text-sm min-w-36">
+                            فصل الطالب
+                            <select
+                              dir="ltr"
+                              value={classDraft}
+                              onChange={(event) => { setClassDraft(event.target.value); setEditError(""); }}
+                              className="block w-full mt-1 rounded-lg border-2 border-teal-300 bg-white px-3 py-2.5 font-bold focus:border-teal-600 focus:outline-none"
+                            >
+                              <option value="" disabled>اختر الفصل</option>
+                              {CLASSES.map((className) => <option key={className} value={className}>{className}</option>)}
+                            </select>
+                          </label>
+                          <button type="submit" disabled={savingDetails} className="rounded-lg bg-teal-700 text-white px-5 py-2.5 font-extrabold disabled:opacity-50">
+                            {savingDetails ? "جارٍ الحفظ..." : "حفظ البيانات"}
                           </button>
-                          <button type="button" onClick={() => setEditingId(null)} disabled={savingName} className="rounded-lg bg-white border border-slate-300 text-slate-700 px-4 py-2.5 font-bold disabled:opacity-50">
+                          <button type="button" onClick={() => setEditingId(null)} disabled={savingDetails} className="rounded-lg bg-white border border-slate-300 text-slate-700 px-4 py-2.5 font-bold disabled:opacity-50">
                             إلغاء
                           </button>
-                          {nameError && <p role="alert" className="w-full text-sm font-bold text-rose-700">{nameError}</p>}
+                          {editError && <p role="alert" className="w-full text-sm font-bold text-rose-700">{editError}</p>}
                         </form>
                       )}
                       {isOpen && (

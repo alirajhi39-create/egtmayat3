@@ -2,6 +2,7 @@
  * إدارة تقدم الطالب: يحفظ محلياً دائماً، ويزامن مع قاعدة بيانات Neon
  * عبر /api/progress إذا كانت متاحة (على Vercel).
  */
+import { isClassName, normalizeClassName } from "./classes";
 
 export type StudentProgress = {
   id: string;
@@ -26,7 +27,9 @@ export let online = true;
 export function getSession(): StudentProgress | null {
   try {
     const raw = localStorage.getItem(LS_SESSION);
-    return raw ? (JSON.parse(raw) as StudentProgress) : null;
+    if (!raw) return null;
+    const session = JSON.parse(raw) as StudentProgress;
+    return { ...session, className: normalizeClassName(session.className) };
   } catch {
     return null;
   }
@@ -38,7 +41,7 @@ export function createSession(studentName: string, className: string, totalSlide
   const session: StudentProgress = {
     id: sameStudent ? existing.id : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     studentName,
-    className,
+    className: normalizeClassName(className),
     maxSlide: sameStudent ? existing.maxSlide : 0,
     totalSlides,
     quizScore: sameStudent ? existing.quizScore : null,
@@ -92,7 +95,7 @@ async function push(s: StudentProgress) {
     online = res.ok;
     if (res.ok) {
       const data = await res.json();
-      if (typeof data.studentName === "string") applyCanonicalName(s.id, data.studentName);
+      applyCanonicalDetails(s.id, data);
     }
   } catch {
     online = false;
@@ -112,54 +115,72 @@ function saveLocal(s: StudentProgress) {
 
 export function readLocal(): StudentProgress[] {
   try {
-    return JSON.parse(localStorage.getItem(LS_LOCAL_DB) || "[]");
+    const students = JSON.parse(localStorage.getItem(LS_LOCAL_DB) || "[]") as StudentProgress[];
+    return students.map((student) => ({ ...student, className: normalizeClassName(student.className) }));
   } catch {
     return [];
   }
 }
 
-/** إبقاء الاسم الذي اعتمده المعلم حتى عند استمرار جهاز الطالب بإرسال الاسم السابق. */
-function applyCanonicalName(id: string, name: string) {
+/** إبقاء اسم الطالب وفصله المعتمدين من المعلم رغم طلبات الحفظ القديمة. */
+function applyCanonicalDetails(id: string, details: { studentName?: unknown; className?: unknown }) {
+  const name = typeof details.studentName === "string" ? details.studentName : undefined;
+  const className = typeof details.className === "string" ? normalizeClassName(details.className) : undefined;
   const session = getSession();
-  if (session?.id === id && session.studentName !== name) {
-    localStorage.setItem(LS_SESSION, JSON.stringify({ ...session, studentName: name }));
+  if (session?.id === id && (name && session.studentName !== name || className !== undefined && session.className !== className)) {
+    localStorage.setItem(LS_SESSION, JSON.stringify({ ...session, studentName: name || session.studentName, className: className ?? session.className }));
     window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
   }
   const local = readLocal();
   const index = local.findIndex((student) => student.id === id);
-  if (index !== -1 && local[index].studentName !== name) {
-    local[index] = { ...local[index], studentName: name };
+  if (index !== -1 && (name && local[index].studentName !== name || className !== undefined && local[index].className !== className)) {
+    local[index] = { ...local[index], studentName: name || local[index].studentName, className: className ?? local[index].className };
     localStorage.setItem(LS_LOCAL_DB, JSON.stringify(local));
   }
 }
 
-/** تحديث اسم الطالب في الجلسة عند تعديل المعلم له من جهاز آخر. */
-export async function refreshSessionName() {
+/** تحديث اسم الطالب وفصله في الجلسة عند تعديل المعلم من جهاز آخر. */
+export async function refreshSessionDetails() {
   const session = getSession();
   if (!session) return;
   try {
     const res = await fetch(`/api/progress?id=${encodeURIComponent(session.id)}`, { cache: "no-store" });
     if (!res.ok) return;
     const data = await res.json();
-    if (typeof data.studentName === "string") applyCanonicalName(session.id, data.studentName);
+    applyCanonicalDetails(session.id, data);
   } catch {}
 }
 
-/** تحديث اسم سجل موجود فقط؛ لا يتغير المعرف أو التقدم أو الإجابات. */
-export async function renameStudent(id: string, name: string): Promise<string> {
-  const normalized = name.replace(/\s+/g, " ").trim();
-  if (normalized.length < 3 || normalized.length > 100) throw new Error("الاسم يجب أن يكون بين ٣ و١٠٠ حرف");
+/** تحديث بيانات السجل المحددة فقط؛ لا يتغير المعرف أو التقدم أو الإجابات. */
+export async function updateStudentDetails(id: string, details: { studentName?: string; className?: string }) {
+  const patch: { studentName?: string; className?: string } = {};
+  if (details.studentName !== undefined) {
+    const normalized = details.studentName.replace(/\s+/g, " ").trim();
+    if (normalized.length < 3 || normalized.length > 100) throw new Error("الاسم يجب أن يكون بين ٣ و١٠٠ حرف");
+    patch.studentName = normalized;
+  }
+  if (details.className !== undefined) {
+    const normalized = normalizeClassName(details.className);
+    if (!isClassName(normalized)) throw new Error("اختر الفصل 6 / أ أو 6 / ب");
+    patch.className = normalized;
+  }
+  if (!Object.keys(patch).length) throw new Error("حدد الاسم أو الفصل المراد تعديله");
   const res = await fetch(`/api/progress?id=${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ studentName: normalized }),
+    body: JSON.stringify(patch),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok || typeof data.studentName !== "string") {
-    throw new Error(data.error || "تعذر حفظ الاسم في قاعدة البيانات. تحقق من اتصال Neon وأعد المحاولة.");
+    throw new Error(data.error || "تعذر حفظ بيانات الطالب في قاعدة Neon. تحقق من الاتصال وأعد المحاولة.");
   }
-  applyCanonicalName(id, data.studentName);
-  return data.studentName;
+  applyCanonicalDetails(id, data);
+  return { studentName: data.studentName as string, className: typeof data.className === "string" ? normalizeClassName(data.className) : undefined };
+}
+
+export async function renameStudent(id: string, name: string): Promise<string> {
+  const saved = await updateStudentDetails(id, { studentName: name });
+  return saved.studentName;
 }
 
 export function clearLocal() {
@@ -175,7 +196,7 @@ export async function fetchStudents(): Promise<{ students: StudentProgress[]; so
     const students: StudentProgress[] = (data.students || []).map((r: any) => ({
       id: r.id,
       studentName: r.student_name,
-      className: r.class_name || "",
+      className: normalizeClassName(r.class_name),
       maxSlide: r.max_slide ?? 0,
       totalSlides: r.total_slides ?? 14,
       quizScore: r.quiz_score,
@@ -249,7 +270,7 @@ export function parseBackup(text: string): StudentProgress[] {
     return {
       id,
       studentName,
-      className: typeof raw.className === "string" ? raw.className : "",
+      className: normalizeClassName(raw.className),
       maxSlide: numberOrNull(raw.maxSlide) ?? 0,
       totalSlides: numberOrNull(raw.totalSlides) || 14,
       quizScore: numberOrNull(raw.quizScore),
@@ -290,7 +311,7 @@ export async function deleteAllRemote() {
 
 /* ============ تصدير CSV ============ */
 export function toCSV(students: StudentProgress[]): string {
-  const headers = ["اسم الطالب", "الصف", "الشرائح المنجزة", "نسبة التقدم", "درجة الاختبار", "آخر نشاط", "إجابات الأنشطة"];
+  const headers = ["اسم الطالب", "الفصل", "الشرائح المنجزة", "نسبة التقدم", "درجة الاختبار", "آخر نشاط", "إجابات الأنشطة"];
   const lines = students.map((s) => {
     const pct = Math.round(((s.maxSlide + 1) / (s.totalSlides || 14)) * 100);
     const acts = Object.entries(s.activities || {})

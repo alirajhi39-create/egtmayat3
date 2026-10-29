@@ -1,12 +1,11 @@
 import { useState } from "react";
 import { createSession } from "../lib/progress";
+import { CLASSES, type ClassName } from "../lib/classes";
 import { playSuccess, playClick } from "../utils/audio";
-
-const CLASSES = ["٦/١", "٦/٢"];
 
 export function StudentLogin({ onStart, onTeacher }: { onStart: () => void; onTeacher: () => void }) {
   const [name, setName] = useState("");
-  const [cls, setCls] = useState(CLASSES[0]);
+  const [cls, setCls] = useState<ClassName>(CLASSES[0]);
   const [error, setError] = useState("");
 
   const start = () => {
@@ -61,7 +60,7 @@ export function StudentLogin({ onStart, onTeacher }: { onStart: () => void; onTe
                 cls === c ? "bg-teal-700 border-teal-700 text-white" : "bg-white border-slate-300 text-slate-600 hover:border-teal-400"
               }`}
             >
-              {c}
+              <bdi dir="ltr">{c}</bdi>
             </button>
           ))}
         </div>
