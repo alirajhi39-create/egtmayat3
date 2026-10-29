@@ -8,7 +8,7 @@ import { TeacherDashboard } from "./components/TeacherDashboard";
 import { SlideContext } from "./components/Shared";
 import { playClick, playSuccess, stopAllAudio } from "./utils/audio";
 import { refreshKeys, warmSounds } from "./utils/soundStore";
-import { getSession, updateProgress, endSession, refreshSessionDetails, SESSION_UPDATED_EVENT } from "./lib/progress";
+import { getSession, updateProgress, endSession, refreshSessionDetails, syncSessionProgress, SESSION_UPDATED_EVENT } from "./lib/progress";
 
 const SLIDE_TITLES = [
   { title: "الغلاف والأهداف", icon: "🏠" },
@@ -60,13 +60,18 @@ export default function App() {
   useEffect(() => {
     const sync = () => {
       void refreshKeys();
-      if (view === "lesson") void refreshSessionDetails();
+      if (view === "lesson") {
+        void syncSessionProgress();
+        void refreshSessionDetails();
+      }
     };
     if (view === "lesson") void refreshSessionDetails();
     window.addEventListener("focus", sync);
+    window.addEventListener("online", sync);
     const timer = window.setInterval(sync, 30000);
     return () => {
       window.removeEventListener("focus", sync);
+      window.removeEventListener("online", sync);
       window.clearInterval(timer);
     };
   }, [view]);

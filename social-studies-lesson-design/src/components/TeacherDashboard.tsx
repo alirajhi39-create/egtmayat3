@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchStudents, deleteAllRemote, deleteStudent, renameStudent, toCSV,
-  makeBackup, parseBackup, localOnlyStudents, restoreMissingStudents,
+  makeBackup, parseBackup, localOnlyStudents, restoreMissingStudents, migrateLegacyClasses,
   type StudentProgress,
 } from "../lib/progress";
 import { CLASSES } from "../lib/classes";
@@ -35,6 +35,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   const [savingName, setSavingName] = useState(false);
   const [backupBusy, setBackupBusy] = useState(false);
   const loadVersion = useRef(0);
+  const migrationAttempted = useRef(false);
 
   const load = async () => {
     const version = loadVersion.current;
@@ -44,6 +45,14 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
       setStudents(r.students);
       setSource(r.source);
       setConnectionError(r.error || null);
+      if (r.source === "neon" && !migrationAttempted.current) {
+        migrationAttempted.current = true;
+        void migrateLegacyClasses()
+          .then((updated) => { if (updated) void load(); })
+          .catch(() => {
+            setNotice({ type: "err", text: "الاتصال ببيانات الطلاب يعمل، لكن لم تُحدَّث تسميات الفصول داخل Neon. ستظهر التسميات القديمة في الموقع دون التأثير على الإجابات." });
+          });
+      }
     }
     setLoading(false);
   };

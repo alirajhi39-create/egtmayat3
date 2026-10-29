@@ -19,6 +19,7 @@ export type StudentProgress = {
 
 const LS_SESSION = "lesson2_session";
 const LS_LOCAL_DB = "lesson2_local_students";
+const pendingKey = (id: string) => `lesson2_pending_${id}`;
 export const SESSION_UPDATED_EVENT = "lesson2:session-updated";
 
 export let online = true;
@@ -67,16 +68,31 @@ export function createSession(studentName: string, className: string, totalSlide
   };
   localStorage.setItem(LS_SESSION, JSON.stringify(session));
   saveLocal(session);
-  void push(session);
+  void enqueuePush(session, markPending(session.id));
   return session;
 }
 
 export function endSession() {
+  const session = getSession();
+  if (timer) clearTimeout(timer);
+  timer = null;
+  if (session) {
+    const revision = localStorage.getItem(pendingKey(session.id));
+    if (revision) void enqueuePush(session, revision);
+  }
   localStorage.removeItem(LS_SESSION);
 }
 
 /* ============ التحديث ============ */
 let timer: ReturnType<typeof setTimeout> | null = null;
+const pendingRequests = new Map<string, Promise<void>>();
+
+function markPending(id: string) {
+  const key = pendingKey(id);
+  const revision = String((Number(localStorage.getItem(key)) || 0) + 1);
+  localStorage.setItem(key, revision);
+  return revision;
+}
 
 export function updateProgress(patch: Partial<StudentProgress>): StudentProgress | null {
   const s = getSession();
@@ -90,8 +106,12 @@ export function updateProgress(patch: Partial<StudentProgress>): StudentProgress
   };
   localStorage.setItem(LS_SESSION, JSON.stringify(next));
   saveLocal(next);
+  const revision = markPending(next.id);
   if (timer) clearTimeout(timer);
-  timer = setTimeout(() => void push(next), 800); // تجميع الحفظ لتقليل الطلبات
+  timer = setTimeout(() => {
+    timer = null;
+    void enqueuePush(next, revision);
+  }, 800); // تجميع الحفظ لتقليل الطلبات
   return next;
 }
 
@@ -100,21 +120,44 @@ export function recordActivity(key: string, value: any) {
 }
 
 /* ============ المزامنة مع الخادم ============ */
-async function push(s: StudentProgress) {
+function enqueuePush(s: StudentProgress, revision: string) {
+  // الطلبات المتتابعة لنفس الطالب لا تصل إلى Neon بترتيب معكوس.
+  const previous = pendingRequests.get(s.id) || Promise.resolve();
+  const request = previous.then(() => push(s, revision));
+  pendingRequests.set(s.id, request);
+  void request.finally(() => {
+    if (pendingRequests.get(s.id) === request) pendingRequests.delete(s.id);
+  });
+  return request;
+}
+
+async function push(s: StudentProgress, revision: string) {
   try {
     const res = await fetch("/api/progress", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(s),
     });
-    online = res.ok;
-    if (res.ok) {
-      const data = await res.json();
-      applyCanonicalDetails(s.id, data);
-    }
+    if (!res.ok) throw new Error("لم تُحفظ البيانات في Neon");
+    const data = await res.json();
+    if (!data.ok) throw new Error("لم يُقبل تحديث البيانات في Neon");
+    online = true;
+    if (localStorage.getItem(pendingKey(s.id)) === revision) localStorage.removeItem(pendingKey(s.id));
+    applyCanonicalDetails(s.id, data);
   } catch {
     online = false;
   }
+}
+
+/** إعادة إرسال آخر تقدم محلي عند عودة الإنترنت أو فتح الصفحة مجدداً. */
+export async function syncSessionProgress() {
+  const session = getSession();
+  if (!session) return;
+  const revision = localStorage.getItem(pendingKey(session.id));
+  if (!revision) return;
+  if (timer) clearTimeout(timer);
+  timer = null;
+  await enqueuePush(session, revision);
 }
 
 /* ============ تخزين محلي احتياطي للوحة المعلم ============ */
@@ -222,6 +265,14 @@ export async function fetchStudents(): Promise<{ students: StudentProgress[]; so
   }
 }
 
+/** إعادة تسمية الفصل في القاعدة بعد نجاح القراءة، دون حجب سجلات الطلاب إن فشلت. */
+export async function migrateLegacyClasses(): Promise<number> {
+  const res = await fetch("/api/progress?migrateClasses=1", { method: "POST" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) throw new Error(data.error || "تعذر تحديث تسميات الفصول في Neon");
+  return Number(data.updated) || 0;
+}
+
 /** نسخة احتياطية تشمل سجلات Neon وأي سجلات أقدم لم تُرفع من هذا الجهاز. */
 export function makeBackup(students: StudentProgress[]) {
   const ids = new Set(students.map((student) => student.id));
@@ -304,6 +355,7 @@ export async function deleteStudent(id: string): Promise<boolean> {
   }
   try {
     localStorage.setItem(LS_LOCAL_DB, JSON.stringify(readLocal().filter((s) => s.id !== id)));
+    localStorage.removeItem(pendingKey(id));
   } catch {}
   // إذا كان المحذوف هو جلسة هذا الجهاز نُنهيها حتى لا يُعاد إنشاؤه تلقائياً
   if (getSession()?.id === id) {

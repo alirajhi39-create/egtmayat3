@@ -27,8 +27,8 @@ test("rollback restores the original class label without changing student work",
             if (query.includes("CREATE TABLE")) return [];
             if (query.includes("SET class_name = CASE")) {
               if (globalThis.__failMigration) throw Object.assign(new Error("migration denied"), { code: "42501" });
-              if (row.class_name === "6 / أ") row.class_name = "٦/١";
-              if (row.class_name === "6 / ب") row.class_name = "٦/٢";
+              if (row.class_name === "6 / أ") { row.class_name = "٦/١"; return [{ id: row.id }]; }
+              if (row.class_name === "6 / ب") { row.class_name = "٦/٢"; return [{ id: row.id }]; }
               return [];
             }
             if (query.includes("UPDATE lesson_progress")) {
@@ -46,7 +46,10 @@ test("rollback restores the original class label without changing student work",
             if (query.includes("SELECT student_name, class_name FROM lesson_progress")) {
               return values[0] === row.id ? [{ student_name: row.student_name, class_name: row.class_name }] : [];
             }
-            if (query.includes("SELECT id, student_name")) return [row];
+            if (query.includes("SELECT id, student_name")) {
+              if (globalThis.__missingTable) throw Object.assign(new Error("relation does not exist"), { code: "42P01" });
+              return [row];
+            }
             throw new Error("Unexpected SQL: " + query);
           };`,
           loader: "js",
@@ -63,6 +66,18 @@ test("rollback restores the original class label without changing student work",
     json(body) { this.body = body; return this; },
     end() { return this; },
   });
+
+  const beforeMigration = response();
+  await handler({ method: "GET", query: {} }, beforeMigration);
+  assert.equal(beforeMigration.code, 200);
+  assert.equal(beforeMigration.body.students[0].class_name, "٦/١");
+  assert.equal(row.class_name, "6 / أ");
+  assert.ok(globalThis.__progressQueries.every((query) => !query.includes("CREATE TABLE") && !query.includes("UPDATE lesson_progress")), "GET reads Neon without schema setup or migration");
+
+  const migrationResult = response();
+  await handler({ method: "POST", query: { migrateClasses: "1" } }, migrationResult);
+  assert.equal(migrationResult.body.updated, 1);
+  assert.equal(row.class_name, "٦/١");
 
   const renamed = response();
   await handler({ method: "PATCH", query: { id: row.id }, body: { studentName: "  الاسم   الجديد  " } }, renamed);
@@ -131,6 +146,10 @@ test("rollback restores the original class label without changing student work",
   const secondResult = response();
   await secondHandler({ method: "GET", query: { id: secondRow.id } }, secondResult);
   assert.equal(secondResult.body.className, "٦/٢");
+  assert.equal(secondRow.class_name, "6 / ب");
+  const secondMigration = response();
+  await secondHandler({ method: "POST", query: { migrateClasses: "1" } }, secondMigration);
+  assert.equal(secondMigration.body.updated, 1);
   assert.equal(secondRow.class_name, "٦/٢");
   assert.equal(secondRow.quiz_score, 5);
   assert.deepEqual(secondRow.activities, { "نشاط٣": "إجابة محفوظة" });
@@ -144,6 +163,13 @@ test("rollback restores the original class label without changing student work",
   assert.equal(missing.body.code, "DATABASE_URL_MISSING");
   process.env.DATABASE_URL = missingConnection;
 
+  globalThis.__missingTable = true;
+  const wrongBranch = response();
+  await handler({ method: "GET", query: {} }, wrongBranch);
+  assert.equal(wrongBranch.code, 503);
+  assert.equal(wrongBranch.body.code, "PROGRESS_TABLE_MISSING");
+  globalThis.__missingTable = false;
+
   const oldRow = { ...row, id: "readable-old-student", class_name: "6 / أ" };
   globalThis.__progressRow = oldRow;
   globalThis.__failMigration = true;
@@ -152,6 +178,12 @@ test("rollback restores the original class label without changing student work",
   await readableHandler({ method: "GET", query: {} }, readable);
   assert.equal(readable.code, 200);
   assert.equal(readable.body.students[0].class_name, "٦/١");
+  const deniedMigration = response();
+  await readableHandler({ method: "POST", query: { migrateClasses: "1" } }, deniedMigration);
+  assert.equal(deniedMigration.code, 500);
+  const stillReadable = response();
+  await readableHandler({ method: "GET", query: {} }, stillReadable);
+  assert.equal(stillReadable.code, 200);
   assert.equal(oldRow.activities["نشاط١"], "إجابة سابقة");
   globalThis.__failMigration = false;
 });

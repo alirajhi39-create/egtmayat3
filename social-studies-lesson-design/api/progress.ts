@@ -31,26 +31,6 @@ function ensureTable(sql: any) {
           updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
         );
       `;
-      // إرجاع تسميات الفصل إلى ٦/١ و٦/٢. لا يتغير أي حقل آخر في سجلات الطلاب.
-      try {
-        await sql`
-          UPDATE lesson_progress
-          SET class_name = CASE
-            WHEN replace(class_name, ' ', '') IN ('6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١')
-              THEN '٦/١'
-            ELSE '٦/٢'
-          END
-          WHERE lesson_slug = 'saudi-state-2'
-            AND class_name NOT IN ('٦/١', '٦/٢')
-            AND replace(class_name, ' ', '') IN (
-              '6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١', '٦/١',
-              '6/ب', '٦/ب', '6/2', '٦/2', '6/٢', '٦/٢'
-            );
-        `;
-      } catch (error) {
-        // فشل تغيير اسم الفصل لا يجوز أن يحجب السجلات والإجابات الموجودة.
-        console.error("Class label migration could not run", error instanceof Error ? error.message : "unknown error");
-      }
     })().catch((error) => {
       tableReady = null;
       throw error;
@@ -68,7 +48,28 @@ export default async function handler(req: any, res: any) {
 
   try {
     const sql = sqlClient();
-    await ensureTable(sql);
+    // قراءة السجلات الموجودة لا تحتاج DDL أو استعلام ترحيل قد يؤخرها أو يمنعها.
+    if (req.method !== "GET") await ensureTable(sql);
+
+    /* ===== ترحيل اختياري لتسميات الفصل، منفصل تماماً عن قراءة الطلاب وحفظ تقدمهم ===== */
+    if (req.method === "POST" && req.query?.migrateClasses === "1") {
+      const updated = await sql`
+        UPDATE lesson_progress
+        SET class_name = CASE
+          WHEN replace(class_name, ' ', '') IN ('6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١')
+            THEN '٦/١'
+          ELSE '٦/٢'
+        END
+        WHERE lesson_slug = 'saudi-state-2'
+          AND class_name NOT IN ('٦/١', '٦/٢')
+          AND replace(class_name, ' ', '') IN (
+            '6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١', '٦/١',
+            '6/ب', '٦/ب', '6/2', '٦/2', '6/٢', '٦/٢'
+          )
+        RETURNING id;
+      `;
+      return res.status(200).json({ ok: true, updated: updated.length });
+    }
 
     /* ===== حفظ / تحديث تقدم طالب ===== */
     if (req.method === "POST") {
@@ -199,11 +200,14 @@ export default async function handler(req: any, res: any) {
   } catch (err: any) {
     console.error("Neon progress request failed", err?.code || "", err?.message || "unknown error");
     const missingUrl = err?.code === "DATABASE_URL_MISSING";
-    return res.status(missingUrl ? 503 : 500).json({
+    const missingTable = err?.code === "42P01";
+    return res.status(missingUrl || missingTable ? 503 : 500).json({
       ok: false,
-      code: missingUrl ? "DATABASE_URL_MISSING" : "NEON_REQUEST_FAILED",
+      code: missingUrl ? "DATABASE_URL_MISSING" : missingTable ? "PROGRESS_TABLE_MISSING" : "NEON_REQUEST_FAILED",
       error: missingUrl
         ? "متغير DATABASE_URL غير موجود في إعدادات Vercel لهذا النشر. اربط قاعدة Neon ببيئة Production ثم أعد النشر."
+        : missingTable
+        ? "جدول الطلاب غير موجود في قاعدة البيانات الحالية. تحقق من فرع Neon القديم قبل إنشاء قاعدة جديدة."
         : "تعذر قراءة قاعدة Neon. تحقق من اتصال DATABASE_URL بقاعدة الإنتاج السابقة وراجع سجلات Functions في Vercel.",
     });
   }
