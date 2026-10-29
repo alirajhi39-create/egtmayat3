@@ -1,15 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  fetchStudents,
-  deleteAllRemote,
-  deleteStudent,
-  renameStudent,
-  readLocal,
-  toCSV,
+  fetchStudents, deleteAllRemote, deleteStudent, renameStudent, toCSV,
+  makeBackup, parseBackup, localOnlyStudents, restoreMissingStudents, migrateLegacyClasses,
   type StudentProgress,
 } from "../lib/progress";
 import { PrintReport } from "./PrintReport";
 import { AudioManager } from "./AudioManager";
+import { SharedRegister } from "./SharedRegister";
 import { playClick } from "../utils/audio";
 
 const TEACHER_PIN = "139613";
@@ -17,10 +14,12 @@ const TEACHER_PIN = "139613";
 export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   const [authed, setAuthed] = useState(false);
   const [pin, setPin] = useState("");
+  const [pinError, setPinError] = useState(false);
   const [tab, setTab] = useState<"students" | "audio">("students");
   const [students, setStudents] = useState<StudentProgress[]>([]);
   const [source, setSource] = useState<"neon" | "local">("local");
-  const [loading, setLoading] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("");
   const [open, setOpen] = useState<string | null>(null);
   const [classFilter, setClassFilter] = useState("");
@@ -30,42 +29,32 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   const [printList, setPrintList] = useState<StudentProgress[] | null>(null);
   const [printTitle, setPrintTitle] = useState("تقرير متابعة الطلاب");
   const [notice, setNotice] = useState<{ type: "ok" | "err"; text: string } | null>(null);
-  const [editing, setEditing] = useState<{ id: string; name: string; cls: string } | null>(null);
-  const [bulkOpen, setBulkOpen] = useState(false);
-  const [classEdit, setClassEdit] = useState<{ id: string; name: string; cls: string } | null>(null);
-  const [recovery, setRecovery] = useState<StudentProgress[] | null>(null);
-  const [recovering, setRecovering] = useState(false);
-  const [connError, setConnError] = useState<string | null>(null);
-  const [diag, setDiag] = useState<any>(null);
-  const [diagLoading, setDiagLoading] = useState(false);
-  const [bulkNames, setBulkNames] = useState<Record<string, string>>({});
-  const [bulkClasses, setBulkClasses] = useState<Record<string, string>>({});
-  const [saving, setSaving] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [nameDraft, setNameDraft] = useState("");
+  const [editError, setEditError] = useState("");
+  const [savingName, setSavingName] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const loadVersion = useRef(0);
+  const migrationAttempted = useRef(false);
 
   const load = async () => {
+    const version = loadVersion.current;
     setLoading(true);
     const r = await fetchStudents();
-    setStudents(r.students);
-    setSource(r.source);
-    setLoading(false);
-    // تشخيص: سبب عدم الاتصال بقاعدة البيانات
-    if (r.source === "local") {
-      try {
-        const res = await fetch("/api/progress");
-        const body = await res.json().catch(() => null);
-        setConnError(
-          body?.error
-            ? `تعذّر الاتصال بقاعدة البيانات: ${body.error}`
-            : res.ok
-            ? null
-            : `استجابة غير متوقعة من الخادم (${res.status})`
-        );
-      } catch (e: any) {
-        setConnError(`تعذّر الوصول لدوال الخادم (/api/progress): ${e?.message || "غير معروف"}`);
+    if (version === loadVersion.current) {
+      setStudents(r.students);
+      setSource(r.source);
+      setConnectionError(r.error || null);
+      if (r.source === "neon" && !migrationAttempted.current) {
+        migrationAttempted.current = true;
+        void migrateLegacyClasses()
+          .then((updated) => { if (updated) void load(); })
+          .catch(() => {
+            setNotice({ type: "err", text: "الاتصال ببيانات الطلاب يعمل، لكن لم تُحدَّث تسميات الفصول داخل Neon. ستظهر التسميات القديمة في الموقع دون التأثير على الإجابات." });
+          });
       }
-    } else {
-      setConnError(null);
     }
+    setLoading(false);
   };
 
   useEffect(() => {
@@ -83,10 +72,55 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
     [students, filter, classFilter]
   );
 
-  const classes = useMemo(
-    () => Array.from(new Set(students.map((s) => s.className).filter(Boolean))).sort(),
-    [students]
-  );
+  const localOnlyCount = useMemo(() => source === "neon" ? localOnlyStudents(students).length : 0, [students, source]);
+
+  const downloadBackup = () => {
+    const file = new Blob([makeBackup(students)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(file);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `نسخة-احتياطية-الطلاب-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  };
+
+  const restore = async (records: StudentProgress[]) => {
+    if (source !== "neon") {
+      setNotice({ type: "err", text: "اربط قاعدة Neon أولاً حتى تُحفظ السجلات بعد النشر." });
+      return;
+    }
+    const existing = new Set(students.map((student) => student.id));
+    const missing = records.filter((student) => !existing.has(student.id)).length;
+    if (!missing) {
+      setNotice({ type: "ok", text: "جميع سجلات هذه النسخة محفوظة مسبقاً، ولم يُستبدل أي سجل." });
+      return;
+    }
+    if (!confirm(`إضافة ${missing} سجل طالب غير موجود إلى Neon؟\nلن تُحذف السجلات الحالية أو تُستبدل إجاباتها.`)) return;
+    setBackupBusy(true);
+    try {
+      const result = await restoreMissingStudents(records, students.map((student) => student.id));
+      loadVersion.current++;
+      await load();
+      setNotice({
+        type: result.failed ? "err" : "ok",
+        text: `نُقل ${result.restored} سجل إلى Neon${result.skipped ? `، وتُرك ${result.skipped} سجل موجود دون تغيير` : ""}${result.failed ? `، وتعذر نقل ${result.failed} سجل. أعد المحاولة.` : "."}`,
+      });
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const importBackup = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      if (file.size > 5 * 1024 * 1024) throw new Error("حجم النسخة الاحتياطية أكبر من ٥ ميجابايت");
+      await restore(parseBackup(await file.text()));
+    } catch (error) {
+      setNotice({ type: "err", text: error instanceof Error ? error.message : "تعذر قراءة النسخة الاحتياطية" });
+    }
+  };
 
   /* ===== الطباعة / PDF ===== */
   const startPrint = (
@@ -120,107 +154,43 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   }, [printList, printTitle]);
 
   /* ===== حذف طالب ===== */
-  /* ===== تعديل اسم الطالب مع الحفاظ على بياناته ===== */
-  const saveRename = async () => {
-    if (!editing) return;
-    const name = editing.name.trim();
-    if (name.length < 3) {
-      setNotice({ type: "err", text: "اكتب اسم الطالب الثلاثي بشكل صحيح (٣ أحرف على الأقل)." });
-      return;
-    }
-    setSaving(true);
-    const r = await renameStudent(editing.id, name, editing.cls);
-    setStudents((arr) =>
-      arr.map((s) =>
-        s.id === editing.id
-          ? { ...s, studentName: name, className: editing.cls || s.className, updatedAt: new Date().toISOString() }
-          : s
-      )
-    );
-    setEditing(null);
-    setSaving(false);
-    setNotice(
-      r.synced
-        ? { type: "ok", text: `تم تعديل الاسم إلى «${name}» بنجاح مع الاحتفاظ بجميع بياناته السابقة ✅` }
-        : { type: "ok", text: `تم تعديل الاسم محلياً إلى «${name}». لم يُحفظ في قاعدة البيانات (لا يوجد اتصال).` }
-    );
-    setTimeout(() => setNotice(null), 4500);
-  };
-
-  /* ===== تعديل فصل الطالب فقط (مع الاحتفاظ بالاسم والبيانات) ===== */
-  const saveClass = async () => {
-    if (!classEdit) return;
-    const target = students.find((x) => x.id === classEdit.id);
-    if (!target) return;
-    const r = await renameStudent(classEdit.id, target.studentName, classEdit.cls);
-    setStudents((arr) =>
-      arr.map((s) =>
-        s.id === classEdit.id
-          ? { ...s, className: classEdit.cls, updatedAt: new Date().toISOString() }
-          : s
-      )
-    );
-    setClassEdit(null);
-    setNotice({
-      type: "ok",
-      text: r.synced
-        ? `تم نقل «${target.studentName}» إلى فصل ${classEdit.cls} بنجاح ✅`
-        : `تم نقل «${target.studentName}» إلى فصل ${classEdit.cls} (محلياً فقط — لا يوجد اتصال بقاعدة البيانات).`,
-    });
-    setTimeout(() => setNotice(null), 4500);
-  };
-
-  /* ===== عرض كل السجلات المحفوظة في قاعدة البيانات ============= */
-  const loadAllRecords = async () => {
-    setRecovering(true);
-    try {
-      const res = await fetch("/api/progress");
-      const data = await res.json();
-      const list: StudentProgress[] = (data.students || []).map((r: any) => ({
-        id: r.id,
-        studentName: r.student_name,
-        className: r.class_name || "",
-        maxSlide: r.max_slide ?? 0,
-        totalSlides: r.total_slides ?? 14,
-        quizScore: r.quiz_score,
-        quizTotal: r.quiz_total,
-        activities: r.activities || {},
-        startedAt: r.started_at,
-        updatedAt: r.updated_at,
-      }));
-      setRecovery(list);
-    } catch {
-      const local = readLocal() as StudentProgress[];
-      setRecovery(local.sort((a: StudentProgress, b: StudentProgress) => (a.updatedAt < b.updatedAt ? 1 : -1)));
-    }
-    setRecovering(false);
-  };
-
-  /* ===== تشخيص قاعدة البيانات ===== */
-  const runDiagnose = async () => {
-    setDiagLoading(true);
-    setDiag(null);
-    try {
-      const res = await fetch("/api/progress?diagnose=1");
-      const body = await res.json();
-      setDiag(body);
-    } catch (e: any) {
-      setDiag({ queryOk: false, error: e?.message || "تعذّر الوصول لدالة الخادم" });
-    }
-    setDiagLoading(false);
-  };
-
   const removeStudent = async (st: StudentProgress) => {
     if (!confirm(`هل تريد حذف الطالب «${st.studentName}» وجميع إجاباته نهائياً؟\nلا يمكن التراجع عن هذا الإجراء.`)) return;
     const ok = await deleteStudent(st.id);
+    loadVersion.current++;
     setStudents((arr) => arr.filter((x) => x.id !== st.id));
     if (open === st.id) setOpen(null);
+    if (editingId === st.id) setEditingId(null);
     setNotice(
       ok
         ? { type: "ok", text: `تم حذف الطالب «${st.studentName}» بنجاح ✅` }
         : { type: "err", text: `حُذف «${st.studentName}» محلياً فقط — تعذّر الوصول إلى قاعدة البيانات.` }
     );
     setTimeout(() => setNotice(null), 4000);
+  };
+
+  const saveName = async (event: React.FormEvent<HTMLFormElement>, student: StudentProgress) => {
+    event.preventDefault();
+    const name = nameDraft.replace(/\s+/g, " ").trim();
+    if (name.length < 3 || name.length > 100) {
+      setEditError("اكتب اسماً صحيحاً من ٣ إلى ١٠٠ حرف");
+      return;
+    }
+    if (name === student.studentName) { setEditingId(null); return; }
+    setSavingName(true);
+    setEditError("");
+    try {
+      const savedName = await renameStudent(student.id, name);
+      loadVersion.current++;
+      setStudents((rows) => rows.map((row) => row.id === student.id ? { ...row, studentName: savedName } : row));
+      setEditingId(null);
+      setNotice({ type: "ok", text: `حُفظ اسم الطالب «${savedName}» دون تغيير فصله أو تقدمه أو إجاباته.` });
+      void load();
+    } catch (error) {
+      setEditError(error instanceof Error ? error.message : "تعذر حفظ الاسم. حاول مرة أخرى.");
+    } finally {
+      setSavingName(false);
+    }
   };
 
   const stats = useMemo(() => {
@@ -244,6 +214,13 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
 
   /* ===== شاشة الرمز ===== */
   if (!authed) {
+    const submitPin = (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const valid = pin === TEACHER_PIN;
+      setAuthed(valid);
+      setPinError(!valid);
+    };
+
     return (
       <div dir="rtl" className="min-h-screen bg-gradient-to-br from-teal-950 to-rose-950 flex items-center justify-center p-4">
         <div className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-sm animate-slidein">
@@ -252,27 +229,25 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
             <h2 className="text-2xl font-black text-teal-900 mt-2">لوحة المعلم</h2>
             <p className="text-slate-500 font-bold text-sm">أدخل رمز الدخول</p>
           </div>
-          <div className="flex items-center gap-2 mb-5 bg-amber-50 border-2 border-amber-200 rounded-xl px-4 py-2.5">
-            <span className="text-lg">🔑</span>
-            <span className="font-extrabold text-amber-900 text-sm">رمز الدخول: 139613</span>
-          </div>
-          <input
-            type="password"
-            value={pin}
-            onChange={(e) => setPin(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && setAuthed(pin === TEACHER_PIN)}
-            placeholder="••••"
-            className="w-full rounded-xl border-2 border-slate-300 px-4 py-3 text-center text-2xl font-black tracking-widest focus:border-teal-500 focus:outline-none mb-4"
-          />
-          {pin && pin !== TEACHER_PIN && (
-            <p className="text-rose-600 font-bold text-sm mb-3 text-center">تعذّر الدخول — تأكد من الرمز المدخل</p>
-          )}
-          <button
-            onClick={() => setAuthed(pin === TEACHER_PIN)}
-            className="w-full rounded-xl bg-teal-700 text-white font-black py-3 hover:bg-teal-800 transition-colors mb-3"
-          >
-            دخول
-          </button>
+          <form onSubmit={submitPin}>
+            <input
+              type="password"
+              inputMode="numeric"
+              autoComplete="off"
+              aria-label="رمز دخول المعلم"
+              aria-invalid={pinError}
+              value={pin}
+              onChange={(e) => { setPin(e.target.value); setPinError(false); }}
+              className="w-full rounded-xl border-2 border-slate-300 px-4 py-3 text-center text-2xl font-black tracking-widest focus:border-teal-500 focus:outline-none mb-4"
+            />
+            {pinError && <p role="alert" className="text-rose-600 font-bold text-sm mb-3 text-center">الرمز غير صحيح</p>}
+            <button
+              type="submit"
+              className="w-full rounded-xl bg-teal-700 text-white font-black py-3 hover:bg-teal-800 transition-colors mb-3"
+            >
+              دخول
+            </button>
+          </form>
           <button onClick={onExit} className="w-full rounded-xl bg-slate-100 text-slate-600 font-bold py-2.5 hover:bg-slate-200">
             → رجوع
           </button>
@@ -295,9 +270,6 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <span className={`rounded-full px-2.5 sm:px-3 py-1 text-[10px] sm:text-xs font-black ${source === "neon" ? "bg-emerald-500" : "bg-amber-500 text-amber-950"}`}>
-              {source === "neon" ? "● متصل بقاعدة Neon" : "● وضع محلي (بدون قاعدة بيانات)"}
-            </span>
             <button onClick={onExit} className="rounded-xl bg-white/15 hover:bg-white/25 px-4 py-2 font-bold text-sm">
               خروج
             </button>
@@ -321,6 +293,15 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
           <AudioManager />
         ) : (
           <>
+            <SharedRegister
+              connected={source === "neon"}
+              loading={loading}
+              classFilter={classFilter}
+              count={classFilter ? students.filter((student) => student.className === classFilter).length : students.length}
+              error={connectionError}
+              onRefresh={() => { void load(); }}
+              onSelectClass={setClassFilter}
+            />
             {/* بطاقات الإحصاء */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
               {[
@@ -337,6 +318,49 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
               ))}
             </div>
 
+            <details className="bg-white rounded-xl border border-slate-200 mb-4">
+              <summary className="cursor-pointer px-4 py-3 font-extrabold text-teal-800">
+                النسخ الاحتياطي وحفظ بيانات الطلاب{localOnlyCount > 0 ? ` (${localOnlyCount} سجل على هذا الجهاز لم يُرفع)` : ""}
+              </summary>
+              <div className="px-4 pb-4 border-t border-slate-100 pt-3 space-y-3">
+                <p className="text-sm font-semibold text-slate-600 leading-relaxed">
+                  تبقى سجلات الطلاب وأسماؤهم ودرجاتهم في Neon بعد إعادة نشر الموقع عند استخدام رابط قاعدة البيانات نفسه.
+                  نزّل نسخة احتياطية قبل تغيير مشروع Vercel أو قاعدة Neon.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={downloadBackup} className="rounded-lg bg-teal-700 text-white px-4 py-2 font-bold text-sm hover:bg-teal-800">
+                    تنزيل نسخة احتياطية JSON
+                  </button>
+                  {source === "neon" && (
+                    <label className={`rounded-lg bg-indigo-600 text-white px-4 py-2 font-bold text-sm ${backupBusy ? "opacity-50" : "cursor-pointer hover:bg-indigo-700"}`}>
+                      استعادة بيانات من نسخة احتياطية
+                      <input
+                        type="file"
+                        accept=".json,application/json"
+                        disabled={backupBusy}
+                        className="hidden"
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          event.target.value = "";
+                          void importBackup(file);
+                        }}
+                      />
+                    </label>
+                  )}
+                  {source === "neon" && localOnlyCount > 0 && (
+                    <button
+                      disabled={backupBusy}
+                      onClick={() => void restore(localOnlyStudents(students))}
+                      className="rounded-lg bg-amber-100 text-amber-900 px-4 py-2 font-bold text-sm hover:bg-amber-200 disabled:opacity-50"
+                    >
+                      نقل {localOnlyCount} سجل سابق من هذا الجهاز إلى Neon
+                    </button>
+                  )}
+                </div>
+                {source === "local" && <p className="text-xs font-bold text-amber-800">الاستعادة تتطلب ربط Neon. يمكن تنزيل النسخة الآن ثم استعادتها بعد الربط.</p>}
+              </div>
+            </details>
+
             <div className="flex flex-wrap gap-2 mb-4">
               <input
                 value={filter}
@@ -346,20 +370,6 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
               />
               <button onClick={() => void load()} className="rounded-xl bg-teal-700 text-white font-bold px-4 py-2.5 hover:bg-teal-800">
                 {loading ? "⏳ تحديث…" : "🔄 تحديث"}
-              </button>
-              <button
-                onClick={() => void runDiagnose()}
-                title="تشخيص الاتصال بقاعدة البيانات"
-                className="rounded-xl bg-indigo-600 text-white font-bold px-4 py-2.5 hover:bg-indigo-700"
-              >
-                {diagLoading ? "⏳ جارٍ الفحص…" : "🔬 تشخيص القاعدة"}
-              </button>
-              <button
-                onClick={() => void loadAllRecords()}
-                title="عرض كل السجلات المحفوظة في قاعدة البيانات"
-                className="rounded-xl bg-slate-700 text-white font-bold px-4 py-2.5 hover:bg-slate-800"
-              >
-                {recovering ? "⏳ جارٍ…" : "♻️ استرجاع السجلات"}
               </button>
               <button onClick={exportCSV} className="rounded-xl bg-emerald-600 text-white font-bold px-4 py-2.5 hover:bg-emerald-700">
                 📥 تصدير Excel
@@ -400,21 +410,8 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
               </button>
             </div>
 
-            {/* مرشح الفصل + خيارات محتوى التقرير */}
-            <div className="flex flex-wrap items-center gap-2 mb-4">
-              <span className="font-extrabold text-slate-500 text-sm">الفصل:</span>
-              {["", ...classes].map((c) => (
-                <button
-                  key={c || "all"}
-                  onClick={() => setClassFilter(c)}
-                  className={`rounded-full px-4 py-1.5 text-sm font-extrabold border-2 transition-all ${
-                    classFilter === c ? "bg-teal-700 border-teal-700 text-white" : "bg-white border-slate-300 text-slate-600 hover:border-teal-400"
-                  }`}
-                >
-                  {c || "الكل"}
-                </button>
-              ))}
-              <div className="mr-auto flex flex-wrap items-center gap-x-4 gap-y-1">
+            {/* خيارات محتوى التقرير */}
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-4">
                 <label className="flex items-center gap-2 text-sm font-bold text-slate-600 cursor-pointer">
                   <input
                     type="checkbox"
@@ -433,83 +430,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                   />
                   أسئلة التقويم وإجاباتها
                 </label>
-              </div>
             </div>
-
-            {diag && (
-              <div className="rounded-xl p-4 border-2 border-indigo-300 bg-indigo-50 mb-4 animate-slidein">
-                <p className="font-black text-indigo-900 mb-2">🔬 نتيجة تشخيص قاعدة البيانات</p>
-                <div className="grid sm:grid-cols-2 gap-2 text-xs font-bold">
-                  <div className="bg-white rounded-lg p-2 border border-indigo-100">
-                    <span className="text-slate-500">رابط الاتصال: </span>
-                    <span className={diag.hasUrl ? "text-emerald-700" : "text-rose-700"}>
-                      {diag.hasUrl ? "✅ موجود" : "❌ غير موجود"}
-                    </span>
-                  </div>
-                  <div className="bg-white rounded-lg p-2 border border-indigo-100">
-                    <span className="text-slate-500">الاستعلام: </span>
-                    <span className={diag.queryOk ? "text-emerald-700" : "text-rose-700"}>
-                      {diag.queryOk ? `✅ نجح (${diag.ms}ms)` : "❌ فشل"}
-                    </span>
-                  </div>
-                  <div className="bg-white rounded-lg p-2 border border-indigo-100">
-                    <span className="text-slate-500">عدد سجلات الطلاب: </span>
-                    <span className="text-teal-700">{diag.count ?? "—"}</span>
-                  </div>
-                  <div className="bg-white rounded-lg p-2 border border-indigo-100">
-                    <span className="text-slate-500">سجلات الأسماء المعدّلة: </span>
-                    <span className="text-teal-700">{diag.teacherNames ?? "—"}</span>
-                  </div>
-                </div>
-                {diag.error && (
-                  <p className="mt-2 text-rose-700 font-black text-xs break-words bg-white rounded-lg p-2 border border-rose-200">
-                    {diag.error}
-                  </p>
-                )}
-                {diag.varsFound && (
-                  <div className="mt-2 bg-white rounded-lg p-2 border border-indigo-100">
-                    <p className="font-black text-slate-600 text-[11px] mb-1">المتغيرات البيئية الموجودة في Vercel:</p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {Object.entries(diag.varsFound).map(([k, v]: any) => (
-                        <span
-                          key={k}
-                          className={`rounded-full px-2 py-0.5 text-[10px] font-black ${
-                            v ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-400 line-through"
-                          }`}
-                        >
-                          {k} {v ? "✅" : "❌"}
-                        </span>
-                      ))}
-                    </div>
-                    <p className="font-bold text-slate-500 text-[10px] mt-2 leading-relaxed">
-                      يحتاج النظام واحداً فقط منها. جرّب أولاً <code className="bg-slate-100 px-1 rounded">DATABASE_URL_UNPOOLED</code>{" "}
-                      ثم <code className="bg-slate-100 px-1 rounded">DATABASE_URL</code> — انسخه من Neon ← Connection Details ← Connection string.
-                    </p>
-                  </div>
-                )}
-                {diag.byClass && diag.byClass.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {diag.byClass.map((c: any) => (
-                      <span key={c.class_name} className="bg-white border border-indigo-200 rounded-full px-3 py-1 font-black text-[11px] text-indigo-800">
-                        {c.class_name || "بدون فصل"}: {c.count}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {connError && (
-              <div className="rounded-xl p-4 border-2 border-amber-400 bg-amber-50 mb-4 animate-slidein">
-                <p className="font-black text-amber-900 mb-1">⚠️ لا يوجد اتصال بقاعدة البيانات</p>
-                <p className="font-bold text-amber-800 text-xs leading-relaxed mb-2">{connError}</p>
-                <p className="font-bold text-amber-800 text-xs leading-relaxed">
-                  الحل: في Vercel ← Settings ← Environment Variables ← أضف{" "}
-                  <code className="bg-amber-100 px-1 rounded">DATABASE_URL</code> (رابط Neon) ← ثم أعد النشر.
-                  البيانات المحفوظة على هذا الجهاز ما زالت تعمل بـ«وضع محلي».
-                </p>
-              </div>
-            )}
 
             {notice && (
               <div
@@ -521,10 +442,20 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
               </div>
             )}
 
-            {filtered.length === 0 ? (
+            {loading && students.length === 0 ? (
+              <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center font-bold text-slate-600">
+                جارٍ تحميل سجلات الطلاب...
+              </div>
+            ) : filtered.length === 0 ? (
               <div className="bg-white rounded-2xl border-2 border-dashed border-slate-300 p-12 text-center">
                 <span className="text-5xl">📭</span>
-                <p className="font-extrabold text-slate-500 mt-3">لا توجد سجلات بعد — اطلب من الطلاب بدء الدرس بأسمائهم.</p>
+                <p className="font-extrabold text-slate-500 mt-3">
+                  {filter || classFilter
+                    ? "لا توجد سجلات مطابقة للبحث أو الفصل المحدد."
+                    : source === "neon"
+                      ? "لا توجد سجلات في قاعدة Neon المتصلة حالياً. تحقق من قاعدة إنتاجك السابقة أو استعد نسخة احتياطية، ولا تنشئ قاعدة جديدة قبل التأكد."
+                      : "لا توجد سجلات محلية على هذا الجهاز. تحقق من اتصال Neon لرؤية بيانات الطلاب السابقة."}
+                </p>
               </div>
             ) : (
               <div className="space-y-3">
@@ -544,7 +475,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                           <div className="flex-1 min-w-36">
                             <p className="font-extrabold text-slate-800">{s.studentName}</p>
                             <p className="text-slate-500 font-bold text-xs">
-                              الفصل {s.className || "—"} • آخر نشاط: {new Date(s.updatedAt).toLocaleString("ar-SA")}
+                              الفصل <bdi dir="ltr">{s.className || "—"}</bdi> • آخر نشاط: {new Date(s.updatedAt).toLocaleString("ar-SA")}
                             </p>
                           </div>
                           <div className="w-full sm:w-40 order-last sm:order-none">
@@ -568,20 +499,18 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                           </span>
                           <span className="text-slate-400">{isOpen ? "▲" : "▼"}</span>
                         </button>
-                        <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto sm:shrink-0">
                           <button
-                            onClick={() => setEditing({ id: s.id, name: s.studentName, cls: s.className || "٦/١" })}
-                            title="تعديل اسم الطالب"
-                            className="rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-700 px-3 py-2 text-sm font-extrabold"
+                            onClick={() => {
+                              setEditingId(s.id);
+                              setNameDraft(s.studentName);
+                              setEditError("");
+                            }}
+                            disabled={source !== "neon"}
+                            title={source === "neon" ? "تعديل اسم الطالب" : "يتطلب اتصال قاعدة بيانات Neon"}
+                            className="rounded-lg bg-teal-100 hover:bg-teal-200 text-teal-800 px-3 py-2 text-sm font-extrabold disabled:opacity-50 disabled:cursor-not-allowed"
                           >
-                            ✏️ <span className="hidden sm:inline">تعديل الاسم</span>
-                          </button>
-                          <button
-                            onClick={() => setClassEdit({ id: s.id, name: s.studentName, cls: s.className || "٦/١" })}
-                            title="تعديل فصل الطالب"
-                            className="rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-700 px-3 py-2 text-sm font-extrabold"
-                          >
-                            🏫 <span className="hidden lg:inline">تغيير الفصل</span>
+                            تعديل الاسم
                           </button>
                           <button
                             onClick={() => startPrint([s], `تقرير الطالب ${s.studentName}`)}
@@ -606,6 +535,27 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                           </button>
                         </div>
                       </div>
+                      {editingId === s.id && (
+                        <form onSubmit={(event) => void saveName(event, s)} className="border-t border-teal-200 bg-teal-50 p-4 flex flex-wrap items-end gap-3">
+                          <label className="flex-1 min-w-48 font-extrabold text-teal-900 text-sm">
+                            الاسم الجديد للطالب
+                            <input
+                              autoFocus
+                              maxLength={100}
+                              value={nameDraft}
+                              onChange={(event) => { setNameDraft(event.target.value); setEditError(""); }}
+                              className="block w-full mt-1 rounded-lg border-2 border-teal-300 bg-white px-3 py-2.5 font-bold focus:border-teal-600 focus:outline-none"
+                            />
+                          </label>
+                          <button type="submit" disabled={savingName} className="rounded-lg bg-teal-700 text-white px-5 py-2.5 font-extrabold disabled:opacity-50">
+                            {savingName ? "جارٍ الحفظ..." : "حفظ الاسم"}
+                          </button>
+                          <button type="button" onClick={() => setEditingId(null)} disabled={savingName} className="rounded-lg bg-white border border-slate-300 text-slate-700 px-4 py-2.5 font-bold disabled:opacity-50">
+                            إلغاء
+                          </button>
+                          {editError && <p role="alert" className="w-full text-sm font-bold text-rose-700">{editError}</p>}
+                        </form>
+                      )}
                       {isOpen && (
                         <div className="border-t-2 border-slate-100 p-4 bg-slate-50 animate-slidein">
                           <h4 className="font-extrabold text-teal-800 mb-3">📝 إجابات الأنشطة</h4>
@@ -634,264 +584,6 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
         )}
       </main>
     </div>
-    {recovery && (
-      <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur flex items-center justify-center p-4 print:hidden">
-        <div className="bg-white rounded-3xl shadow-2xl w-full max-w-3xl p-6 animate-slidein max-h-[88vh] flex flex-col">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-xl font-black text-teal-900 flex items-center gap-2">♻️ كل السجلات المحفوظة في قاعدة البيانات</h3>
-            <button onClick={() => setRecovery(null)} className="text-slate-400 hover:text-slate-700 text-2xl font-bold leading-none">
-              ×
-            </button>
-          </div>
-          <p className="text-slate-500 font-bold text-sm mb-4">
-            {recovery.length} سجل — هذه بيانات الطلاب المحفوظة فعلياً في Neon. يمكنك تعديل الأسماء والفصول من هنا مباشرة.
-          </p>
-          <div className="overflow-y-auto flex-1 border-2 border-slate-200 rounded-xl mb-4">
-            <table className="w-full text-sm">
-              <thead className="bg-teal-800 text-white sticky top-0">
-                <tr>
-                  <th className="px-2 py-2 text-right font-extrabold">اسم الطالب</th>
-                  <th className="px-2 py-2 text-right font-extrabold">الفصل</th>
-                  <th className="px-2 py-2 text-right font-extrabold">التقدم</th>
-                  <th className="px-2 py-2 text-right font-extrabold">الدرجة</th>
-                  <th className="px-2 py-2 text-right font-extrabold">إجابات</th>
-                  <th className="px-2 py-2 text-right font-extrabold">آخر نشاط</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recovery.map((r) => (
-                  <tr key={r.id} className="border-b border-slate-100 even:bg-slate-50">
-                    <td className="px-2 py-1.5 font-extrabold">{r.studentName}</td>
-                    <td className="px-2 py-1.5 font-bold">{r.className || "—"}</td>
-                    <td className="px-2 py-1.5 font-bold">{r.maxSlide + 1}/{r.totalSlides}</td>
-                    <td className="px-2 py-1.5 font-bold">{r.quizScore != null ? `${r.quizScore}/${r.quizTotal ?? 8}` : "—"}</td>
-                    <td className="px-2 py-1.5 font-bold">{Object.keys(r.activities || {}).length}</td>
-                    <td className="px-2 py-1.5 text-xs text-slate-500 font-bold">
-                      {new Date(r.updatedAt).toLocaleString("ar-SA")}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={() => {
-                setRecovery(null);
-                void load();
-              }}
-              className="flex-1 rounded-xl bg-teal-700 text-white font-black py-3 hover:bg-teal-800 transition-colors"
-            >
-              ✅ اعتماد هذه السجلات في اللوحة
-            </button>
-            <button onClick={() => setRecovery(null)} className="rounded-xl bg-slate-100 text-slate-600 font-bold px-5 py-3 hover:bg-slate-200">
-              إغلاق
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
-    {bulkOpen && (
-      <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur flex items-center justify-center p-4 print:hidden">
-        <div className="bg-white rounded-3xl shadow-2xl w-full max-w-2xl p-6 animate-slidein max-h-[88vh] flex flex-col">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-xl font-black text-teal-900 flex items-center gap-2">📝 تعديل أسماء الطلاب وفصولهم (دفعة واحدة)</h3>
-            <button onClick={() => setBulkOpen(false)} className="text-slate-400 hover:text-slate-700 text-2xl font-bold leading-none">
-              ×
-            </button>
-          </div>
-          <p className="text-slate-500 font-bold text-sm mb-4">
-            عدّل الأسماء والفصول هنا ثم اضغط «حفظ الكل». لن تتأثر درجات الطلاب ولا إجاباتهم ولا تقدمهم.
-          </p>
-          <div className="overflow-y-auto flex-1 space-y-2 mb-4" dir="rtl">
-            {filtered.map((s) => (
-              <div key={s.id} className="flex items-center gap-2">
-                <span className="w-24 shrink-0 font-extrabold text-slate-500 text-xs truncate">{s.studentName}</span>
-                <input
-                  value={bulkNames[s.id] ?? s.studentName}
-                  onChange={(e) => setBulkNames((b) => ({ ...b, [s.id]: e.target.value }))}
-                  className="flex-1 rounded-lg border-2 border-slate-300 px-3 py-2 font-bold text-sm focus:border-teal-500 focus:outline-none"
-                />
-                <select
-                  value={bulkClasses[s.id] ?? s.className ?? "٦/١"}
-                  onChange={(e) => setBulkClasses((b) => ({ ...b, [s.id]: e.target.value }))}
-                  className="shrink-0 rounded-lg border-2 border-slate-300 px-2 py-1.5 font-black text-[11px] text-slate-700 focus:border-teal-500 focus:outline-none"
-                >
-                  <option value="٦/١">٦/١</option>
-                  <option value="٦/٢">٦/٢</option>
-                </select>
-              </div>
-            ))}
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={async () => {
-                const list = filtered.filter((orig) => {
-                  const newName = (bulkNames[orig.id] ?? orig.studentName).trim();
-                  const newCls = bulkClasses[orig.id] ?? orig.className ?? "٦/١";
-                  return (
-                    (newName !== orig.studentName && newName.length >= 3) || newCls !== orig.className
-                  );
-                });
-                if (!list.length) {
-                  setNotice({ type: "err", text: "لا توجد تعديلات جديدة للحفظ." });
-                  setTimeout(() => setNotice(null), 3500);
-                  return;
-                }
-                for (const orig of list) {
-                  const newName = (bulkNames[orig.id] ?? orig.studentName).trim();
-                  const newCls = bulkClasses[orig.id] ?? orig.className ?? "٦/١";
-                  await renameStudent(
-                    orig.id,
-                    newName.length >= 3 ? newName : orig.studentName,
-                    newCls
-                  );
-                  setStudents((arr) =>
-                    arr.map((s) =>
-                      s.id === orig.id
-                        ? {
-                            ...s,
-                            studentName: newName.length >= 3 ? newName : s.studentName,
-                            className: newCls,
-                            updatedAt: new Date().toISOString(),
-                          }
-                        : s
-                    )
-                  );
-                }
-                setNotice({
-                  type: "ok",
-                  text: `تم تحديث ${list.length} طالب (اسم وفصل) مع الاحتفاظ ببياناتهم ✅`,
-                });
-                setTimeout(() => setNotice(null), 4500);
-                setBulkOpen(false);
-                setBulkNames({});
-                setBulkClasses({});
-              }}
-              className="flex-1 rounded-xl bg-teal-700 text-white font-black py-3 hover:bg-teal-800 transition-colors"
-            >
-              💾 حفظ الكل
-            </button>
-            <button onClick={() => setBulkOpen(false)} className="rounded-xl bg-slate-100 text-slate-600 font-bold px-5 py-3 hover:bg-slate-200">
-              إلغاء
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
-    {classEdit && (
-      <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur flex items-center justify-center p-4 print:hidden">
-        <div className="bg-white rounded-3xl shadow-2xl w-full max-w-md p-6 animate-slidein">
-          <div className="flex items-center justify-between mb-5">
-            <h3 className="text-xl font-black text-teal-900 flex items-center gap-2">🏫 تغيير فصل الطالب</h3>
-            <button onClick={() => setClassEdit(null)} className="text-slate-400 hover:text-slate-700 text-2xl font-bold leading-none">
-              ×
-            </button>
-          </div>
-
-          <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-5">
-            <p className="font-extrabold text-slate-800">{classEdit.name}</p>
-            <p className="text-slate-500 font-bold text-xs mt-1">الفصل الحالي: {classEdit.cls}</p>
-          </div>
-
-          <label className="block font-extrabold text-slate-700 mb-2 text-sm">اختر الفصل الجديد</label>
-          <div className="grid grid-cols-2 gap-3 mb-5">
-            {["٦/١", "٦/٢"].map((c) => (
-              <button
-                key={c}
-                onClick={() => setClassEdit({ ...classEdit, cls: c })}
-                className={`rounded-xl py-3 font-black text-lg border-2 transition-all ${
-                  classEdit.cls === c
-                    ? "bg-teal-700 border-teal-700 text-white shadow-md"
-                    : "bg-white border-slate-300 text-slate-600 hover:border-teal-400"
-                }`}
-              >
-                {c}
-              </button>
-            ))}
-          </div>
-
-          <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 mb-5">
-            <p className="text-emerald-900 font-bold text-xs leading-relaxed">
-              ✅ سيُحفظ الفصل الجديد فقط. اسم الطالب ودرجته وتقدمه وإجاباته لن تتأثر.
-            </p>
-          </div>
-
-          <div className="flex gap-2">
-            <button
-              onClick={() => void saveClass()}
-              className="flex-1 rounded-xl bg-teal-700 text-white font-black py-3 hover:bg-teal-800 transition-colors"
-            >
-              💾 حفظ الفصل
-            </button>
-            <button
-              onClick={() => setClassEdit(null)}
-              className="rounded-xl bg-slate-100 text-slate-600 font-bold px-5 py-3 hover:bg-slate-200"
-            >
-              إلغاء
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
-    {editing && (
-      <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur flex items-center justify-center p-4 print:hidden">
-        <div className="bg-white rounded-3xl shadow-2xl w-full max-w-md p-6 animate-slidein">
-          <div className="flex items-center justify-between mb-5">
-            <h3 className="text-xl font-black text-teal-900 flex items-center gap-2">✏️ تعديل اسم الطالب</h3>
-            <button onClick={() => setEditing(null)} className="text-slate-400 hover:text-slate-700 text-2xl font-bold leading-none">
-              ×
-            </button>
-          </div>
-
-          <label className="block font-extrabold text-slate-700 mb-2 text-sm">اسم الطالب (ثلاثي)</label>
-          <input
-            value={editing.name}
-            onChange={(e) => setEditing({ ...editing, name: e.target.value })}
-            onKeyDown={(e) => e.key === "Enter" && void saveRename()}
-            placeholder="مثال: عبدالله محمد العتيبي"
-            className="w-full rounded-xl border-2 border-slate-300 px-4 py-3 font-bold focus:border-teal-500 focus:outline-none mb-4"
-          />
-
-          <label className="block font-extrabold text-slate-700 mb-2 text-sm">الفصل</label>
-          <div className="flex gap-2 mb-5">
-            {["٦/١", "٦/٢"].map((c) => (
-              <button
-                key={c}
-                onClick={() => setEditing({ ...editing, cls: c })}
-                className={`rounded-xl px-5 py-2 font-extrabold border-2 transition-all ${
-                  editing.cls === c ? "bg-teal-700 border-teal-700 text-white" : "bg-white border-slate-300 text-slate-600 hover:border-teal-400"
-                }`}
-              >
-                {c}
-              </button>
-            ))}
-          </div>
-
-          <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 mb-5">
-            <p className="text-emerald-900 font-bold text-xs leading-relaxed">
-              ✅ لن تتأثر بيانات الطالب: التقدم في الدرس، درجة الاختبار، وإجابات الأنشطة تبقى كما هي. يُحفظ الاسم الجديد فقط.
-            </p>
-          </div>
-
-          <div className="flex gap-2">
-            <button
-              onClick={() => void saveRename()}
-              disabled={saving}
-              className="flex-1 rounded-xl bg-teal-700 text-white font-black py-3 hover:bg-teal-800 transition-colors disabled:opacity-50"
-            >
-              {saving ? "⏳ جارٍ الحفظ…" : "💾 حفظ التعديل"}
-            </button>
-            <button
-              onClick={() => setEditing(null)}
-              className="rounded-xl bg-slate-100 text-slate-600 font-bold px-5 py-3 hover:bg-slate-200"
-            >
-              إلغاء
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
     {printList && (
       <PrintReport
         students={printList}

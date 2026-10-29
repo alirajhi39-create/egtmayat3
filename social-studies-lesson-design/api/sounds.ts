@@ -12,27 +12,9 @@ import { neon } from "@neondatabase/serverless";
 
 export const MAX_SOUND_BYTES = 4 * 1024 * 1024;
 
-/** قراءة رابط قاعدة البيانات — نفضّل UNPOOLED ثم العادي */
-function getDatabaseUrl(): string | null {
-  const candidates = [
-    process.env.DATABASE_URL_UNPOOLED,
-    process.env.DATABASE_URL,
-    process.env.NEON_DATABASE_URL,
-    process.env.POSTGRES_URL,
-    process.env.POSTGRES_URL_UNPOOLED,
-    process.env.POSTGRES_PRISMA_URL,
-    process.env.POSTGRES_DATABASE_URL,
-    process.env.SALAH_DATABASE_URL,
-  ];
-  for (const c of candidates) {
-    if (c && c.trim() && !c.includes("YOUR_") && !c.includes("xxxx")) return c.trim();
-  }
-  return null;
-}
-
 const sqlClient = () => {
-  const url = getDatabaseUrl();
-  if (!url) throw new Error("لا يوجد متغير بيئة لقاعدة البيانات (DATABASE_URL أو DATABASE_URL_UNPOOLED أو POSTGRES_URL)");
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error("DATABASE_URL غير معرّف");
   return neon(url);
 };
 
@@ -90,18 +72,6 @@ async function readRaw(req: any): Promise<Buffer> {
   });
 }
 
-/** لا نُنشئ الجدول في كل طلب */
-let ready: Promise<void> | null = null;
-function ensureReady(sql: any): Promise<void> {
-  if (!ready) {
-    ready = ensureTable(sql).catch((e) => {
-      ready = null;
-      throw e;
-    });
-  }
-  return ready;
-}
-
 export default async function handler(req: any, res: any) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
@@ -112,15 +82,12 @@ export default async function handler(req: any, res: any) {
 
   try {
     const sql = sqlClient();
-    try {
-      await ensureReady(sql);
-    } catch (e: any) {
-      console.warn("ensureTable:", e?.message);
-    }
 
     /* ========= رفع ملف ========= */
     if (req.method === "POST") {
       if (!key) return res.status(400).json({ ok: false, error: "المفتاح مطلوب" });
+      // يُنشأ الجدول عند أول رفع فقط؛ القراءات اللاحقة لا تحتاج استعلام إنشاء.
+      await ensureTable(sql);
 
       const buf = await readRaw(req);
 
@@ -164,30 +131,40 @@ export default async function handler(req: any, res: any) {
 
     /* ========= إرجاع ملف محدد ========= */
     if (key) {
-      const rows = await sql`
-        SELECT mime, data, size, updated_at FROM lesson_sounds WHERE key = ${key} LIMIT 1
-      `;
+      const rows = await sql`SELECT mime, data FROM lesson_sounds WHERE key = ${key} LIMIT 1`;
       if (!rows.length) return res.status(404).json({ ok: false, error: "غير موجود" });
-
       const buf = toBuffer(rows[0].data);
-      const mime = rows[0].mime || "audio/mpeg";
-      const version = String(rows[0].updated_at || "1");
-      const etag = `"${key}-${version}"`;
+      res.setHeader("Content-Type", rows[0].mime || "audio/mpeg");
+      res.setHeader("Accept-Ranges", "bytes");
 
-      // دعم Conditional Request لتسريع تكرار التشغيل
-      if (req.headers["if-none-match"] === etag) {
-        res.setHeader("ETag", etag);
-        return res.status(304).end();
+      // يختلف الرابط بعد استبدال الملف (v=updatedAt)، فتُخزَّن النسخة الجديدة مستقلة.
+      if (req.query?.v) {
+        res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=86400, immutable");
+      } else {
+        res.setHeader("Cache-Control", "no-store");
       }
 
-      res.setHeader("Content-Type", mime);
+      // بعض متصفحات الجوال تتطلب 206 لتشغيل الصوت مباشرة من الشبكة.
+      const range = String(req.headers.range || "");
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (range && !match) {
+        res.setHeader("Content-Range", `bytes */${buf.length}`);
+        return res.status(416).end();
+      }
+      if (match) {
+        const start = match[1] ? Number(match[1]) : Math.max(0, buf.length - Number(match[2]));
+        const end = match[1] ? (match[2] ? Number(match[2]) : buf.length - 1) : buf.length - 1;
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= buf.length || end < start) {
+          res.setHeader("Content-Range", `bytes */${buf.length}`);
+          return res.status(416).end();
+        }
+        const chunk = buf.subarray(start, Math.min(end, buf.length - 1) + 1);
+        res.setHeader("Content-Range", `bytes ${start}-${start + chunk.length - 1}/${buf.length}`);
+        res.setHeader("Content-Length", String(chunk.length));
+        return res.status(206).send(chunk);
+      }
+
       res.setHeader("Content-Length", String(buf.length));
-      res.setHeader("Accept-Ranges", "none");
-      res.setHeader("ETag", etag);
-      res.setHeader(
-        "Cache-Control",
-        "public, max-age=604800, stale-while-revalidate=86400"
-      );
       return res.status(200).send(buf);
     }
 
@@ -198,6 +175,7 @@ export default async function handler(req: any, res: any) {
       ORDER BY updated_at DESC
       LIMIT 500;
     `;
+    res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       maxBytes: MAX_SOUND_BYTES,
@@ -210,6 +188,13 @@ export default async function handler(req: any, res: any) {
       })),
     });
   } catch (err: any) {
+    // قبل رفع أول ملف لا يوجد جدول بعد؛ الواجهة ترى قائمة فارغة بدلاً من خطأ.
+    if (err?.code === "42P01") {
+      if (key && req.method !== "DELETE") return res.status(404).json({ ok: false, error: "غير موجود" });
+      if (req.method === "DELETE") return res.status(200).json({ ok: true });
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({ ok: true, maxBytes: MAX_SOUND_BYTES, sounds: [] });
+    }
     return res.status(500).json({ ok: false, error: err?.message || "خطأ في الخادم" });
   }
 }

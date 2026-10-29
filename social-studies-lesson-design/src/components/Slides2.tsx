@@ -1,6 +1,12 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { StrategyBadge, SpeakButton, SectionTitle, SlideCard, ActivityHeader, useActivityAnswer } from "./Shared";
 import { playReveal, playCorrect, playWrong, playClick, playSuccess } from "../utils/audio";
+
+function useSuccessSound() {
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+  return () => { timer.current = setTimeout(playSuccess, 400); };
+}
 
 /* ========== الشريحة 5: أسباب عودة الدولة - خريطة ذهنية تفاعلية ========== */
 const REASONS = [
@@ -136,6 +142,7 @@ export function TimelineSlide() {
   const [placed, setPlaced] = useState<(number | null)[]>([null, null, null, null]);
   const [selected, setSelected] = useState<number | null>(null);
   const [done, setDone] = useState(false);
+  const celebrate = useSuccessSound();
 
   const place = (slot: number) => {
     if (selected === null || placed[slot] !== null) return;
@@ -149,7 +156,7 @@ export function TimelineSlide() {
       setSelected(null);
       if (newPlaced.every((x) => x !== null)) {
         setDone(true);
-        setTimeout(playSuccess, 400);
+        celebrate();
       }
     } else {
       playWrong();
@@ -284,6 +291,7 @@ export function TraitsMatchSlide() {
   const [matched, setMatched] = useState<boolean[]>(Array(TRAITS.length).fill(false));
   const [shake, setShake] = useState<number | null>(null);
   const allDone = matched.every(Boolean);
+  const celebrate = useSuccessSound();
 
   const tryMatch = (descIdx: number) => {
     if (selTrait === null || matched[descIdx]) return;
@@ -293,7 +301,7 @@ export function TraitsMatchSlide() {
       m[descIdx] = true;
       setMatched(m);
       setSelTrait(null);
-      if (m.every(Boolean)) setTimeout(playSuccess, 400);
+      if (m.every(Boolean)) celebrate();
     } else {
       playWrong();
       setShake(descIdx);

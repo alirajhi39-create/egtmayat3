@@ -1,6 +1,6 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react";
-import { speak, stopSpeaking, stopAllSounds, playClick, hasPlayingSound } from "../utils/audio";
-import { recordActivity } from "../lib/progress";
+import { createContext, useContext, useEffect, useState } from "react";
+import { speak, stopSpeaking, playClick } from "../utils/audio";
+import { getSession, recordActivity } from "../lib/progress";
 
 /** سياق يحمل رقم الشريحة الحالية لربط ملفات التعليق الصوتي بها */
 export const SlideContext = createContext(0);
@@ -15,12 +15,14 @@ export const narrationKey = (slide: number, variant?: string) =>
  * في قاعدة البيانات / التخزين المحلي ليراها المعلم.
  */
 export function useActivityAnswer(key: string, initial = "") {
-  const [value, setValue] = useState(initial);
-  const t = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [value, setValue] = useState(() => {
+    const saved = getSession()?.activities?.[key];
+    return typeof saved === "string" ? saved : initial;
+  });
   const set = (v: string) => {
     setValue(v);
-    if (t.current) clearTimeout(t.current);
-    t.current = setTimeout(() => recordActivity(key, v), 600);
+    // يُحفظ محلياً فور الكتابة؛ طبقة التقدم تجمع طلبات الشبكة بنفسها.
+    recordActivity(key, v);
   };
   return [value, set] as const;
 }
@@ -46,82 +48,41 @@ export function SpeakButton({
   variant?: string;
 }) {
   const [speaking, setSpeaking] = useState(false);
-  const [loading, setLoading] = useState(false);
   const slide = useSlideIndex();
 
   useEffect(() => {
-    return () => {
-      stopSpeaking();
-      stopAllSounds();
-    };
-  }, []);
+    return () => stopSpeaking();
+  }, [slide, variant]);
 
   const toggle = () => {
     playClick();
-    if (speaking || loading) {
+    if (speaking) {
       stopSpeaking();
-      stopAllSounds();
       setSpeaking(false);
-      setLoading(false);
-      return;
+    } else {
+      setSpeaking(true);
+      speak(text, () => setSpeaking(false), narrationKey(slide, variant));
     }
-    setLoading(true);
-    setSpeaking(true);
-    const key = narrationKey(slide, variant);
-    speak(text, () => {
-      setSpeaking(false);
-      setLoading(false);
-    }, key);
-    // إيقاف مؤشر الانتظار بعد مهلة قصيرة إذا لم يبدأ الصوت
-    window.setTimeout(() => setLoading(false), 1500);
   };
 
   return (
     <button
       onClick={toggle}
       className={`inline-flex items-center gap-2 rounded-full px-4 sm:px-5 py-2.5 text-sm font-bold transition-all shadow-md ${
-        speaking || loading
+        speaking
           ? "bg-rose-600 text-white animate-pulse"
           : "bg-teal-600 text-white hover:bg-teal-700 hover:scale-105"
       }`}
     >
-      {loading ? (
+      {speaking ? (
         <>
-          <span className="text-lg">⏳</span> جارٍ التحميل…
-        </>
-      ) : speaking ? (
-        <>
-          <span className="text-lg">⏹️</span> إيقاف
+          <span className="text-lg">⏹️</span> إيقاف القراءة
         </>
       ) : (
         <>
           <span className="text-lg">🔊</span> {label}
         </>
       )}
-    </button>
-  );
-}
-
-/** زر إيقاف كل الأصوات — يظهر في الشريط العلوي */
-export function StopAllButton() {
-  const [active, setActive] = useState(false);
-  useEffect(() => {
-    const t = setInterval(() => setActive(hasPlayingSound()), 400);
-    return () => clearInterval(t);
-  }, []);
-  return (
-    <button
-      onClick={() => {
-        stopSpeaking();
-        stopAllSounds();
-        setActive(false);
-      }}
-      title="إيقاف كل الأصوات"
-      className={`rounded-full px-2.5 sm:px-3 py-1 transition-colors ${
-        active ? "bg-rose-500 text-white animate-pulse" : "bg-white/15 hover:bg-white/25"
-      }`}
-    >
-      🔇
     </button>
   );
 }

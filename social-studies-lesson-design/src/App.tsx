@@ -5,10 +5,10 @@ import { CapitalSlide, Activity2Slide, Activity3Slide, FactsSlide } from "./comp
 import { QuizSlide, FinaleSlide } from "./components/Quiz";
 import { StudentLogin } from "./components/StudentLogin";
 import { TeacherDashboard } from "./components/TeacherDashboard";
-import { SlideContext, StopAllButton } from "./components/Shared";
-import { playClick, stopSpeaking, stopAllSounds, preloadSounds } from "./utils/audio";
-import { refreshKeys, listRemoteKeys, primeSound } from "./utils/soundStore";
-import { getSession, updateProgress, endSession } from "./lib/progress";
+import { SlideContext } from "./components/Shared";
+import { playClick, playSuccess, stopAllAudio } from "./utils/audio";
+import { refreshKeys, warmSounds } from "./utils/soundStore";
+import { getSession, updateProgress, endSession, refreshSessionDetails, syncSessionProgress, SESSION_UPDATED_EVENT } from "./lib/progress";
 
 const SLIDE_TITLES = [
   { title: "الغلاف والأهداف", icon: "🏠" },
@@ -43,50 +43,41 @@ export default function App() {
     if (view === "lesson") updateProgress({ maxSlide: slide, totalSlides });
   }, [slide, view, totalSlides]);
 
-  /* تحديث بيانات الطالب المعروضة إذا استُرجعت من الخادم */
+  useEffect(() => {
+    const updateName = () => setStudent(getSession());
+    window.addEventListener(SESSION_UPDATED_EVENT, updateName);
+    return () => window.removeEventListener(SESSION_UPDATED_EVENT, updateName);
+  }, []);
+
   useEffect(() => {
     if (view !== "lesson") return;
-    const t = setInterval(() => {
-      const s = getSession();
-      if (s && (!student || s.studentName !== student.studentName || s.className !== student.className)) {
-        setStudent(s);
+    if (slide === 13 && !finished) return; // الاختبار يهيئ السؤال الحالي والتالي بنفسه
+    warmSounds(finished
+      ? ["voice-slide-14", "sfx-click"]
+      : [`voice-slide-${slide}`, `voice-slide-${slide + 1}`, "sfx-click"]);
+  }, [slide, finished, view]);
+
+  useEffect(() => {
+    const sync = () => {
+      void refreshKeys();
+      if (view === "lesson") {
+        void syncSessionProgress();
+        void refreshSessionDetails();
       }
-    }, 1200);
-    return () => clearInterval(t);
-  }, [view, student]);
-
-  /* تحميل مسبق للأصوات السحابية مرة واحدة عند الإقلاع */
-  useEffect(() => {
-    void (async () => {
-      await refreshKeys();
-      const keys = listRemoteKeys();
-      if (keys.length) preloadSounds(keys);
-    })();
-  }, []);
-
-  /* تسخين صوت الشريحة الحالية مسبقاً (تقليل التأخر على أجهزة الطلاب) */
-  useEffect(() => {
-    if (view !== "lesson") return;
-    primeSound(`voice-slide-${slide}`);
-    primeSound(`voice-slide-13-q${Math.min(8, slide + 1)}`);
-  }, [slide, view]);
-
-  /* إيقاف الصوت عند إغلاق الصفحة أو إخفاءها */
-  useEffect(() => {
-    const stop = () => {
-      stopSpeaking();
-      stopAllSounds();
     };
-    window.addEventListener("beforeunload", stop);
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) stop();
-    });
-    return () => window.removeEventListener("beforeunload", stop);
-  }, []);
+    if (view === "lesson") void refreshSessionDetails();
+    window.addEventListener("focus", sync);
+    window.addEventListener("online", sync);
+    const timer = window.setInterval(sync, 30000);
+    return () => {
+      window.removeEventListener("focus", sync);
+      window.removeEventListener("online", sync);
+      window.clearInterval(timer);
+    };
+  }, [view]);
 
   const go = (n: number) => {
-    stopSpeaking();
-    stopAllSounds();
+    stopAllAudio();
     playClick();
     setFinished(false);
     setSlide(Math.max(0, Math.min(totalSlides - 1, n)));
@@ -94,16 +85,15 @@ export default function App() {
   };
 
   const handleQuizFinish = (score: number) => {
-    stopSpeaking();
-    stopAllSounds();
+    stopAllAudio();
     setFinalScore(score);
     setFinished(true);
+    playSuccess();
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const restart = () => {
-    stopSpeaking();
-    stopAllSounds();
+    stopAllAudio();
     playClick();
     setFinished(false);
     setSlide(0);
@@ -111,8 +101,7 @@ export default function App() {
   };
 
   const logout = () => {
-    stopSpeaking();
-    stopAllSounds();
+    stopAllAudio();
     endSession();
     setStudent(null);
     setSlide(0);
@@ -123,13 +112,19 @@ export default function App() {
   if (view === "login")
     return (
       <StudentLogin
-        onStart={() => { setStudent(getSession()); setSlide(0); setFinished(false); setView("lesson"); }}
-        onTeacher={() => setView("teacher")}
+        onStart={() => {
+          const session = getSession();
+          setStudent(session);
+          setSlide(session?.maxSlide ?? 0);
+          setFinished(false);
+          setView("lesson");
+        }}
+        onTeacher={() => { stopAllAudio(); setView("teacher"); }}
       />
     );
 
   if (view === "teacher")
-    return <TeacherDashboard onExit={() => setView(getSession() ? "lesson" : "login")} />;
+    return <TeacherDashboard onExit={() => { stopAllAudio(); setView(getSession() ? "lesson" : "login"); }} />;
 
   const renderSlide = () => {
     if (finished) return <FinaleSlide score={finalScore} total={QUIZ_TOTAL} onRestart={restart} />;
@@ -175,8 +170,7 @@ export default function App() {
               <span className="rounded-full bg-white/15 px-2.5 sm:px-3 py-1">
                 {finished ? "النتيجة" : `${slide + 1}/${totalSlides}`}
               </span>
-              <StopAllButton />
-              <button onClick={() => setView("teacher")} className="rounded-full bg-white/15 hover:bg-white/25 px-2.5 sm:px-3 py-1" title="لوحة المعلم">
+              <button onClick={() => { stopAllAudio(); setView("teacher"); }} className="rounded-full bg-white/15 hover:bg-white/25 px-2.5 sm:px-3 py-1" title="لوحة المعلم">
                 👨‍🏫
               </button>
               <button onClick={logout} className="rounded-full bg-white/15 hover:bg-rose-500 px-2.5 sm:px-3 py-1" title="إنهاء الجلسة">
@@ -186,7 +180,7 @@ export default function App() {
           </div>
           {student && (
             <div className="sm:hidden px-3 pb-2 text-[11px] font-extrabold text-amber-300 truncate">
-              👤 الطالب: {student.studentName} • الفصل {student.className}
+              👤 الطالب: {student.studentName} • الفصل <bdi dir="ltr">{student.className}</bdi>
             </div>
           )}
           <div className="h-1.5 bg-teal-950">
