@@ -18,6 +18,7 @@ export type StudentProgress = {
 
 const LS_SESSION = "lesson2_session";
 const LS_LOCAL_DB = "lesson2_local_students";
+export const SESSION_UPDATED_EVENT = "lesson2:session-updated";
 
 export let online = true;
 
@@ -33,19 +34,17 @@ export function getSession(): StudentProgress | null {
 
 export function createSession(studentName: string, className: string, totalSlides: number): StudentProgress {
   const existing = getSession();
+  const sameStudent = existing?.studentName === studentName;
   const session: StudentProgress = {
-    id:
-      existing && existing.studentName === studentName
-        ? existing.id
-        : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: sameStudent ? existing.id : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     studentName,
     className,
-    maxSlide: existing && existing.studentName === studentName ? existing.maxSlide : 0,
+    maxSlide: sameStudent ? existing.maxSlide : 0,
     totalSlides,
-    quizScore: existing && existing.studentName === studentName ? existing.quizScore : null,
-    quizTotal: null,
-    activities: existing && existing.studentName === studentName ? existing.activities : {},
-    startedAt: new Date().toISOString(),
+    quizScore: sameStudent ? existing.quizScore : null,
+    quizTotal: sameStudent ? existing.quizTotal : null,
+    activities: sameStudent ? existing.activities : {},
+    startedAt: sameStudent ? existing.startedAt : new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   localStorage.setItem(LS_SESSION, JSON.stringify(session));
@@ -91,6 +90,10 @@ async function push(s: StudentProgress) {
       body: JSON.stringify(s),
     });
     online = res.ok;
+    if (res.ok) {
+      const data = await res.json();
+      if (typeof data.studentName === "string") applyCanonicalName(s.id, data.studentName);
+    }
   } catch {
     online = false;
   }
@@ -113,6 +116,50 @@ export function readLocal(): StudentProgress[] {
   } catch {
     return [];
   }
+}
+
+/** إبقاء الاسم الذي اعتمده المعلم حتى عند استمرار جهاز الطالب بإرسال الاسم السابق. */
+function applyCanonicalName(id: string, name: string) {
+  const session = getSession();
+  if (session?.id === id && session.studentName !== name) {
+    localStorage.setItem(LS_SESSION, JSON.stringify({ ...session, studentName: name }));
+    window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
+  }
+  const local = readLocal();
+  const index = local.findIndex((student) => student.id === id);
+  if (index !== -1 && local[index].studentName !== name) {
+    local[index] = { ...local[index], studentName: name };
+    localStorage.setItem(LS_LOCAL_DB, JSON.stringify(local));
+  }
+}
+
+/** تحديث اسم الطالب في الجلسة عند تعديل المعلم له من جهاز آخر. */
+export async function refreshSessionName() {
+  const session = getSession();
+  if (!session) return;
+  try {
+    const res = await fetch(`/api/progress?id=${encodeURIComponent(session.id)}`, { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (typeof data.studentName === "string") applyCanonicalName(session.id, data.studentName);
+  } catch {}
+}
+
+/** تحديث اسم سجل موجود فقط؛ لا يتغير المعرف أو التقدم أو الإجابات. */
+export async function renameStudent(id: string, name: string): Promise<string> {
+  const normalized = name.replace(/\s+/g, " ").trim();
+  if (normalized.length < 3 || normalized.length > 100) throw new Error("الاسم يجب أن يكون بين ٣ و١٠٠ حرف");
+  const res = await fetch(`/api/progress?id=${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ studentName: normalized }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok || typeof data.studentName !== "string") {
+    throw new Error(data.error || "تعذر حفظ الاسم في قاعدة البيانات. تحقق من اتصال Neon وأعد المحاولة.");
+  }
+  applyCanonicalName(id, data.studentName);
+  return data.studentName;
 }
 
 export function clearLocal() {
@@ -141,6 +188,77 @@ export async function fetchStudents(): Promise<{ students: StudentProgress[]; so
   } catch {
     return { students: readLocal().sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)), source: "local" };
   }
+}
+
+/** نسخة احتياطية تشمل سجلات Neon وأي سجلات أقدم لم تُرفع من هذا الجهاز. */
+export function makeBackup(students: StudentProgress[]) {
+  const ids = new Set(students.map((student) => student.id));
+  const localOnly = readLocal().filter((student) => !ids.has(student.id));
+  return JSON.stringify({ version: 1, lessonSlug: "saudi-state-2", exportedAt: new Date().toISOString(), students: [...students, ...localOnly] }, null, 2);
+}
+
+export function localOnlyStudents(students: StudentProgress[]) {
+  const ids = new Set(students.map((student) => student.id));
+  return readLocal().filter((student) => !ids.has(student.id));
+}
+
+/** استعادة السجلات غير الموجودة فقط حتى لا تستبدل النسخة القديمة عمل الطلاب الجديد. */
+export async function restoreMissingStudents(records: StudentProgress[], existingIds: string[]) {
+  const known = new Set(existingIds);
+  let restored = 0;
+  let skipped = 0;
+  let failed = 0;
+  const missing = records.filter((student) => {
+    if (known.has(student.id)) return false;
+    known.add(student.id);
+    return true;
+  });
+  for (let i = 0; i < missing.length; i += 3) {
+    const results = await Promise.all(missing.slice(i, i + 3).map(async (student) => {
+      try {
+        const res = await fetch("/api/progress?restore=1", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(student),
+        });
+        const data = await res.json();
+        return res.ok && data.ok ? (data.created ? "restored" : "skipped") : "failed";
+      } catch { return "failed"; }
+    }));
+    restored += results.filter((result) => result === "restored").length;
+    skipped += results.filter((result) => result === "skipped").length;
+    failed += results.filter((result) => result === "failed").length;
+  }
+  return { restored, skipped, failed };
+}
+
+export function parseBackup(text: string): StudentProgress[] {
+  let backup: any;
+  try { backup = JSON.parse(text); } catch { throw new Error("الملف ليس نسخة احتياطية صالحة"); }
+  if (backup?.lessonSlug !== "saudi-state-2" || !Array.isArray(backup.students) || backup.students.length > 2000) {
+    throw new Error("النسخة الاحتياطية غير صالحة لهذا الدرس أو تحتوي على عدد كبير جداً من السجلات");
+  }
+  return backup.students.map((raw: any) => {
+    const id = typeof raw?.id === "string" ? raw.id.trim() : "";
+    const studentName = typeof raw?.studentName === "string" ? raw.studentName.replace(/\s+/g, " ").trim() : "";
+    if (!id || id.length > 120 || studentName.length < 3 || studentName.length > 100) {
+      throw new Error("النسخة تحتوي على سجل طالب غير صالح");
+    }
+    const validDate = (value: unknown) => typeof value === "string" && !Number.isNaN(Date.parse(value)) ? value : new Date().toISOString();
+    const numberOrNull = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+    return {
+      id,
+      studentName,
+      className: typeof raw.className === "string" ? raw.className : "",
+      maxSlide: numberOrNull(raw.maxSlide) ?? 0,
+      totalSlides: numberOrNull(raw.totalSlides) || 14,
+      quizScore: numberOrNull(raw.quizScore),
+      quizTotal: numberOrNull(raw.quizTotal),
+      activities: raw.activities && typeof raw.activities === "object" && !Array.isArray(raw.activities) ? raw.activities : {},
+      startedAt: validDate(raw.startedAt),
+      updatedAt: validDate(raw.updatedAt),
+    } satisfies StudentProgress;
+  });
 }
 
 /** حذف طالب واحد من قاعدة البيانات ومن التخزين المحلي */

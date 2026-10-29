@@ -1,5 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
-import { fetchStudents, deleteAllRemote, deleteStudent, toCSV, type StudentProgress } from "../lib/progress";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  fetchStudents, deleteAllRemote, deleteStudent, renameStudent, toCSV,
+  makeBackup, parseBackup, localOnlyStudents, restoreMissingStudents,
+  type StudentProgress,
+} from "../lib/progress";
 import { PrintReport } from "./PrintReport";
 import { AudioManager } from "./AudioManager";
 import { playClick } from "../utils/audio";
@@ -13,7 +17,7 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   const [tab, setTab] = useState<"students" | "audio">("students");
   const [students, setStudents] = useState<StudentProgress[]>([]);
   const [source, setSource] = useState<"neon" | "local">("local");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("");
   const [open, setOpen] = useState<string | null>(null);
   const [classFilter, setClassFilter] = useState("");
@@ -23,12 +27,21 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   const [printList, setPrintList] = useState<StudentProgress[] | null>(null);
   const [printTitle, setPrintTitle] = useState("تقرير متابعة الطلاب");
   const [notice, setNotice] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [nameDraft, setNameDraft] = useState("");
+  const [nameError, setNameError] = useState("");
+  const [savingName, setSavingName] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const loadVersion = useRef(0);
 
   const load = async () => {
+    const version = loadVersion.current;
     setLoading(true);
     const r = await fetchStudents();
-    setStudents(r.students);
-    setSource(r.source);
+    if (version === loadVersion.current) {
+      setStudents(r.students);
+      setSource(r.source);
+    }
     setLoading(false);
   };
 
@@ -51,6 +64,56 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
     () => Array.from(new Set(students.map((s) => s.className).filter(Boolean))).sort(),
     [students]
   );
+
+  const localOnlyCount = useMemo(() => source === "neon" ? localOnlyStudents(students).length : 0, [students, source]);
+
+  const downloadBackup = () => {
+    const file = new Blob([makeBackup(students)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(file);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `نسخة-احتياطية-الطلاب-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  };
+
+  const restore = async (records: StudentProgress[]) => {
+    if (source !== "neon") {
+      setNotice({ type: "err", text: "اربط قاعدة Neon أولاً حتى تُحفظ السجلات بعد النشر." });
+      return;
+    }
+    const existing = new Set(students.map((student) => student.id));
+    const missing = records.filter((student) => !existing.has(student.id)).length;
+    if (!missing) {
+      setNotice({ type: "ok", text: "جميع سجلات هذه النسخة محفوظة مسبقاً، ولم يُستبدل أي سجل." });
+      return;
+    }
+    if (!confirm(`إضافة ${missing} سجل طالب غير موجود إلى Neon؟\nلن تُحذف السجلات الحالية أو تُستبدل إجاباتها.`)) return;
+    setBackupBusy(true);
+    try {
+      const result = await restoreMissingStudents(records, students.map((student) => student.id));
+      loadVersion.current++;
+      await load();
+      setNotice({
+        type: result.failed ? "err" : "ok",
+        text: `نُقل ${result.restored} سجل إلى Neon${result.skipped ? `، وتُرك ${result.skipped} سجل موجود دون تغيير` : ""}${result.failed ? `، وتعذر نقل ${result.failed} سجل. أعد المحاولة.` : "."}`,
+      });
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const importBackup = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      if (file.size > 5 * 1024 * 1024) throw new Error("حجم النسخة الاحتياطية أكبر من ٥ ميجابايت");
+      await restore(parseBackup(await file.text()));
+    } catch (error) {
+      setNotice({ type: "err", text: error instanceof Error ? error.message : "تعذر قراءة النسخة الاحتياطية" });
+    }
+  };
 
   /* ===== الطباعة / PDF ===== */
   const startPrint = (
@@ -87,14 +150,40 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
   const removeStudent = async (st: StudentProgress) => {
     if (!confirm(`هل تريد حذف الطالب «${st.studentName}» وجميع إجاباته نهائياً؟\nلا يمكن التراجع عن هذا الإجراء.`)) return;
     const ok = await deleteStudent(st.id);
+    loadVersion.current++;
     setStudents((arr) => arr.filter((x) => x.id !== st.id));
     if (open === st.id) setOpen(null);
+    if (editingId === st.id) setEditingId(null);
     setNotice(
       ok
         ? { type: "ok", text: `تم حذف الطالب «${st.studentName}» بنجاح ✅` }
         : { type: "err", text: `حُذف «${st.studentName}» محلياً فقط — تعذّر الوصول إلى قاعدة البيانات.` }
     );
     setTimeout(() => setNotice(null), 4000);
+  };
+
+  const saveName = async (event: React.FormEvent<HTMLFormElement>, student: StudentProgress) => {
+    event.preventDefault();
+    const name = nameDraft.replace(/\s+/g, " ").trim();
+    if (name.length < 3 || name.length > 100) {
+      setNameError("اكتب اسماً صحيحاً من ٣ إلى ١٠٠ حرف");
+      return;
+    }
+    if (name === student.studentName) { setEditingId(null); return; }
+    setSavingName(true);
+    setNameError("");
+    try {
+      const savedName = await renameStudent(student.id, name);
+      loadVersion.current++;
+      setStudents((rows) => rows.map((row) => row.id === student.id ? { ...row, studentName: savedName } : row));
+      setEditingId(null);
+      setNotice({ type: "ok", text: `حُفظ اسم الطالب «${savedName}» دون تغيير تقدمه أو إجاباته.` });
+      void load();
+    } catch (error) {
+      setNameError(error instanceof Error ? error.message : "تعذر حفظ الاسم. حاول مرة أخرى.");
+    } finally {
+      setSavingName(false);
+    }
   };
 
   const stats = useMemo(() => {
@@ -215,6 +304,55 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                 </div>
               ))}
             </div>
+
+            {!loading && source === "local" && (
+              <p className="text-sm font-bold text-amber-900 bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 mb-4">
+                تعديل أسماء الطلاب وحفظها بين الأجهزة وبعد النشر يتطلب اتصال قاعدة بيانات Neon.
+              </p>
+            )}
+
+            <details className="bg-white rounded-xl border border-slate-200 mb-4">
+              <summary className="cursor-pointer px-4 py-3 font-extrabold text-teal-800">
+                النسخ الاحتياطي وحفظ بيانات الطلاب{localOnlyCount > 0 ? ` (${localOnlyCount} سجل على هذا الجهاز لم يُرفع)` : ""}
+              </summary>
+              <div className="px-4 pb-4 border-t border-slate-100 pt-3 space-y-3">
+                <p className="text-sm font-semibold text-slate-600 leading-relaxed">
+                  تبقى سجلات الطلاب وأسماؤهم ودرجاتهم في Neon بعد إعادة نشر الموقع عند استخدام رابط قاعدة البيانات نفسه.
+                  نزّل نسخة احتياطية قبل تغيير مشروع Vercel أو قاعدة Neon.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={downloadBackup} className="rounded-lg bg-teal-700 text-white px-4 py-2 font-bold text-sm hover:bg-teal-800">
+                    تنزيل نسخة احتياطية JSON
+                  </button>
+                  {source === "neon" && (
+                    <label className={`rounded-lg bg-indigo-600 text-white px-4 py-2 font-bold text-sm ${backupBusy ? "opacity-50" : "cursor-pointer hover:bg-indigo-700"}`}>
+                      استعادة بيانات من نسخة احتياطية
+                      <input
+                        type="file"
+                        accept=".json,application/json"
+                        disabled={backupBusy}
+                        className="hidden"
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          event.target.value = "";
+                          void importBackup(file);
+                        }}
+                      />
+                    </label>
+                  )}
+                  {source === "neon" && localOnlyCount > 0 && (
+                    <button
+                      disabled={backupBusy}
+                      onClick={() => void restore(localOnlyStudents(students))}
+                      className="rounded-lg bg-amber-100 text-amber-900 px-4 py-2 font-bold text-sm hover:bg-amber-200 disabled:opacity-50"
+                    >
+                      نقل {localOnlyCount} سجل سابق من هذا الجهاز إلى Neon
+                    </button>
+                  )}
+                </div>
+                {source === "local" && <p className="text-xs font-bold text-amber-800">الاستعادة تتطلب ربط Neon. يمكن تنزيل النسخة الآن ثم استعادتها بعد الربط.</p>}
+              </div>
+            </details>
 
             <div className="flex flex-wrap gap-2 mb-4">
               <input
@@ -358,7 +496,19 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                           </span>
                           <span className="text-slate-400">{isOpen ? "▲" : "▼"}</span>
                         </button>
-                        <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto sm:shrink-0">
+                          <button
+                            onClick={() => {
+                              setEditingId(s.id);
+                              setNameDraft(s.studentName);
+                              setNameError("");
+                            }}
+                            disabled={source !== "neon"}
+                            title={source === "neon" ? "تعديل اسم الطالب" : "يتطلب اتصال قاعدة بيانات Neon"}
+                            className="rounded-lg bg-teal-100 hover:bg-teal-200 text-teal-800 px-3 py-2 text-sm font-extrabold disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            تعديل الاسم
+                          </button>
                           <button
                             onClick={() => startPrint([s], `تقرير الطالب ${s.studentName}`)}
                             title="طباعة تقرير هذا الطالب PDF"
@@ -382,6 +532,27 @@ export function TeacherDashboard({ onExit }: { onExit: () => void }) {
                           </button>
                         </div>
                       </div>
+                      {editingId === s.id && (
+                        <form onSubmit={(event) => void saveName(event, s)} className="border-t border-teal-200 bg-teal-50 p-4 flex flex-wrap items-end gap-3">
+                          <label className="flex-1 min-w-48 font-extrabold text-teal-900 text-sm">
+                            الاسم الجديد للطالب
+                            <input
+                              autoFocus
+                              maxLength={100}
+                              value={nameDraft}
+                              onChange={(event) => { setNameDraft(event.target.value); setNameError(""); }}
+                              className="block w-full mt-1 rounded-lg border-2 border-teal-300 bg-white px-3 py-2.5 font-bold focus:border-teal-600 focus:outline-none"
+                            />
+                          </label>
+                          <button type="submit" disabled={savingName} className="rounded-lg bg-teal-700 text-white px-5 py-2.5 font-extrabold disabled:opacity-50">
+                            {savingName ? "جارٍ الحفظ..." : "حفظ الاسم"}
+                          </button>
+                          <button type="button" onClick={() => setEditingId(null)} disabled={savingName} className="rounded-lg bg-white border border-slate-300 text-slate-700 px-4 py-2.5 font-bold disabled:opacity-50">
+                            إلغاء
+                          </button>
+                          {nameError && <p role="alert" className="w-full text-sm font-bold text-rose-700">{nameError}</p>}
+                        </form>
+                      )}
                       {isOpen && (
                         <div className="border-t-2 border-slate-100 p-4 bg-slate-50 animate-slidein">
                           <h4 className="font-extrabold text-teal-800 mb-3">📝 إجابات الأنشطة</h4>

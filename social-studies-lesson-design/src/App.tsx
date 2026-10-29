@@ -8,7 +8,7 @@ import { TeacherDashboard } from "./components/TeacherDashboard";
 import { SlideContext } from "./components/Shared";
 import { playClick, playSuccess, stopAllAudio } from "./utils/audio";
 import { refreshKeys, warmSounds } from "./utils/soundStore";
-import { getSession, updateProgress, endSession } from "./lib/progress";
+import { getSession, updateProgress, endSession, refreshSessionName, SESSION_UPDATED_EVENT } from "./lib/progress";
 
 const SLIDE_TITLES = [
   { title: "الغلاف والأهداف", icon: "🏠" },
@@ -44,6 +44,12 @@ export default function App() {
   }, [slide, view, totalSlides]);
 
   useEffect(() => {
+    const updateName = () => setStudent(getSession());
+    window.addEventListener(SESSION_UPDATED_EVENT, updateName);
+    return () => window.removeEventListener(SESSION_UPDATED_EVENT, updateName);
+  }, []);
+
+  useEffect(() => {
     if (view !== "lesson") return;
     if (slide === 13 && !finished) return; // الاختبار يهيئ السؤال الحالي والتالي بنفسه
     warmSounds(finished
@@ -52,14 +58,18 @@ export default function App() {
   }, [slide, finished, view]);
 
   useEffect(() => {
-    const sync = () => { void refreshKeys(); };
+    const sync = () => {
+      void refreshKeys();
+      if (view === "lesson") void refreshSessionName();
+    };
+    if (view === "lesson") void refreshSessionName();
     window.addEventListener("focus", sync);
     const timer = window.setInterval(sync, 30000);
     return () => {
       window.removeEventListener("focus", sync);
       window.clearInterval(timer);
     };
-  }, []);
+  }, [view]);
 
   const go = (n: number) => {
     stopAllAudio();
