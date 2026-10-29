@@ -2,7 +2,6 @@
  * إدارة تقدم الطالب: يحفظ محلياً دائماً، ويزامن مع قاعدة بيانات Neon
  * عبر /api/progress إذا كانت متاحة (على Vercel).
  */
-import { normalizeClassName } from "./classes";
 
 export type StudentProgress = {
   id: string;
@@ -19,8 +18,7 @@ export type StudentProgress = {
 
 const LS_SESSION = "lesson2_session";
 const LS_LOCAL_DB = "lesson2_local_students";
-const pendingKey = (id: string) => `lesson2_pending_${id}`;
-export const SESSION_UPDATED_EVENT = "lesson2:session-updated";
+const LS_RENAMED = "lesson2_teacher_renamed";
 
 export let online = true;
 
@@ -28,71 +26,78 @@ export let online = true;
 export function getSession(): StudentProgress | null {
   try {
     const raw = localStorage.getItem(LS_SESSION);
-    if (!raw) return null;
-    const session = JSON.parse(raw) as StudentProgress;
-    return { ...session, className: normalizeClassName(session.className) };
+    return raw ? (JSON.parse(raw) as StudentProgress) : null;
   } catch {
     return null;
   }
 }
 
-/** البحث عن عمل الطالب المحفوظ على هذا الجهاز، حتى لو كان من إصدار قديم للتطبيق. */
-export function findLocalStudent(studentName: string, className: string): StudentProgress | null {
-  const name = studentName.replace(/\s+/g, " ").trim();
-  const selectedClass = normalizeClassName(className);
-  const sameName = readLocal().filter((student) => student.studentName.replace(/\s+/g, " ").trim() === name);
-  const sameClass = sameName.filter((student) => student.className === selectedClass);
-  if (sameClass.length) {
-    return sameClass.sort((a, b) => b.maxSlide - a.maxSlide || Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
-  }
-  // قد يكون المعلم نقل الطالب لفصل آخر أثناء انقطاع جهاز الطالب عن الإنترنت.
-  return sameName.length === 1 ? sameName[0] : null;
-}
-
-export function createSession(studentName: string, className: string, totalSlides: number, resumeLocal = false): StudentProgress {
+export function createSession(studentName: string, className: string, totalSlides: number): StudentProgress {
   const existing = getSession();
-  const name = studentName.replace(/\s+/g, " ").trim();
-  const sameStudent = existing?.studentName === name;
-  const previous = sameStudent ? existing : resumeLocal ? findLocalStudent(name, className) : null;
+  const sameStudent = existing && existing.studentName === studentName;
+
   const session: StudentProgress = {
-    id: previous?.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    studentName: previous?.studentName || name,
-    className: normalizeClassName(className),
-    maxSlide: previous?.maxSlide ?? 0,
+    id:
+      sameStudent
+        ? existing.id
+        : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    studentName,
+    className,
+    maxSlide: sameStudent ? existing.maxSlide : 0,
     totalSlides,
-    quizScore: previous?.quizScore ?? null,
-    quizTotal: previous?.quizTotal ?? null,
-    activities: previous?.activities ?? {},
-    startedAt: previous?.startedAt || new Date().toISOString(),
+    quizScore: sameStudent ? existing.quizScore : null,
+    quizTotal: sameStudent ? existing.quizTotal : null,
+    activities: sameStudent ? existing.activities : {},
+    startedAt: sameStudent ? existing.startedAt : new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   localStorage.setItem(LS_SESSION, JSON.stringify(session));
   saveLocal(session);
-  void enqueuePush(session, markPending(session.id));
+  void push(session);
+  void restoreFromServer(studentName, className, session.id);
   return session;
 }
 
+/**
+ * استرجاع بيانات الطالب السابقة من الخادم عند الدخول بنفس الاسم.
+ * يحافظ على التقدّم والدرجة والأنشطة السابقة حتى لو كان المتصفح الجديد.
+ */
+async function restoreFromServer(studentName: string, className: string, newId: string) {
+  try {
+    const res = await fetch(`/api/progress?name=${encodeURIComponent(studentName)}&class=${encodeURIComponent(className)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const found = (data.students || [])[0] as any;
+    if (!found) return;
+
+    // نستخدم نفس معرّف السجل القديم حتى تُستعاد كل بياناته على الـ id نفسه
+    const restored: StudentProgress = {
+      id: found.id,
+      studentName: found.student_name || studentName,
+      className: found.class_name || className,
+      maxSlide: found.max_slide ?? 0,
+      totalSlides: found.total_slides ?? 14,
+      quizScore: found.quiz_score ?? null,
+      quizTotal: found.quiz_total ?? null,
+      activities: found.activities || {},
+      startedAt: found.started_at || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const sess = getSession();
+    if (sess && sess.id === newId) {
+      localStorage.setItem(LS_SESSION, JSON.stringify(restored));
+      saveLocal(restored);
+      void push(restored);
+    }
+  } catch {}
+}
+
 export function endSession() {
-  const session = getSession();
-  if (timer) clearTimeout(timer);
-  timer = null;
-  if (session) {
-    const revision = localStorage.getItem(pendingKey(session.id));
-    if (revision) void enqueuePush(session, revision);
-  }
   localStorage.removeItem(LS_SESSION);
 }
 
 /* ============ التحديث ============ */
 let timer: ReturnType<typeof setTimeout> | null = null;
-const pendingRequests = new Map<string, Promise<void>>();
-
-function markPending(id: string) {
-  const key = pendingKey(id);
-  const revision = String((Number(localStorage.getItem(key)) || 0) + 1);
-  localStorage.setItem(key, revision);
-  return revision;
-}
 
 export function updateProgress(patch: Partial<StudentProgress>): StudentProgress | null {
   const s = getSession();
@@ -100,18 +105,20 @@ export function updateProgress(patch: Partial<StudentProgress>): StudentProgress
   const next: StudentProgress = {
     ...s,
     ...patch,
+    // التقدم والدرجة لا ينقصان أبداً
     maxSlide: Math.max(s.maxSlide, patch.maxSlide ?? 0),
+    quizScore:
+      patch.quizScore === null || patch.quizScore === undefined
+        ? s.quizScore
+        : Math.max(s.quizScore ?? 0, patch.quizScore),
+    // الأنشطة تُدمج ولا تُستبدل
     activities: { ...s.activities, ...(patch.activities || {}) },
     updatedAt: new Date().toISOString(),
   };
   localStorage.setItem(LS_SESSION, JSON.stringify(next));
   saveLocal(next);
-  const revision = markPending(next.id);
   if (timer) clearTimeout(timer);
-  timer = setTimeout(() => {
-    timer = null;
-    void enqueuePush(next, revision);
-  }, 800); // تجميع الحفظ لتقليل الطلبات
+  timer = setTimeout(() => void push(next), 800); // تجميع الحفظ لتقليل الطلبات
   return next;
 }
 
@@ -120,44 +127,26 @@ export function recordActivity(key: string, value: any) {
 }
 
 /* ============ المزامنة مع الخادم ============ */
-function enqueuePush(s: StudentProgress, revision: string) {
-  // الطلبات المتتابعة لنفس الطالب لا تصل إلى Neon بترتيب معكوس.
-  const previous = pendingRequests.get(s.id) || Promise.resolve();
-  const request = previous.then(() => push(s, revision));
-  pendingRequests.set(s.id, request);
-  void request.finally(() => {
-    if (pendingRequests.get(s.id) === request) pendingRequests.delete(s.id);
-  });
-  return request;
-}
-
-async function push(s: StudentProgress, revision: string) {
+async function push(s: StudentProgress) {
   try {
     const res = await fetch("/api/progress", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(s),
     });
-    if (!res.ok) throw new Error("لم تُحفظ البيانات في Neon");
-    const data = await res.json();
-    if (!data.ok) throw new Error("لم يُقبل تحديث البيانات في Neon");
-    online = true;
-    if (localStorage.getItem(pendingKey(s.id)) === revision) localStorage.removeItem(pendingKey(s.id));
-    applyCanonicalDetails(s.id, data);
+    online = res.ok;
   } catch {
     online = false;
   }
 }
 
-/** إعادة إرسال آخر تقدم محلي عند عودة الإنترنت أو فتح الصفحة مجدداً. */
-export async function syncSessionProgress() {
-  const session = getSession();
-  if (!session) return;
-  const revision = localStorage.getItem(pendingKey(session.id));
-  if (!revision) return;
-  if (timer) clearTimeout(timer);
-  timer = null;
-  await enqueuePush(session, revision);
+/** هل الاسم المعتمد لهذا الطالب جاء من تعديل المعلم؟ */
+export function isTeacherRenamed(id: string): boolean {
+  try {
+    return JSON.parse(localStorage.getItem(LS_RENAMED) || "{}")[id] === true;
+  } catch {
+    return false;
+  }
 }
 
 /* ============ تخزين محلي احتياطي للوحة المعلم ============ */
@@ -173,57 +162,21 @@ function saveLocal(s: StudentProgress) {
 
 export function readLocal(): StudentProgress[] {
   try {
-    const students = JSON.parse(localStorage.getItem(LS_LOCAL_DB) || "[]") as StudentProgress[];
-    return students.map((student) => ({ ...student, className: normalizeClassName(student.className) }));
+    const raw = JSON.parse(localStorage.getItem(LS_LOCAL_DB) || "[]");
+    // ترحيل أسماء الفصول القديمة إلى الصيغة الجديدة
+    const migrated = raw.map((s: StudentProgress) => ({
+      ...s,
+      className:
+        s.className === "6 / أ" || s.className === "6/أ"
+          ? "٦/١"
+          : s.className === "6 / ب" || s.className === "6/ب"
+          ? "٦/٢"
+          : s.className,
+    }));
+    return migrated;
   } catch {
     return [];
   }
-}
-
-/** إبقاء اسم الطالب وفصله المعتمدين من المعلم رغم طلبات الحفظ القديمة. */
-function applyCanonicalDetails(id: string, details: { studentName?: unknown; className?: unknown }) {
-  const name = typeof details.studentName === "string" ? details.studentName : undefined;
-  const className = typeof details.className === "string" ? normalizeClassName(details.className) : undefined;
-  const session = getSession();
-  if (session?.id === id && (name && session.studentName !== name || className !== undefined && session.className !== className)) {
-    localStorage.setItem(LS_SESSION, JSON.stringify({ ...session, studentName: name || session.studentName, className: className ?? session.className }));
-    window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-  }
-  const local = readLocal();
-  const index = local.findIndex((student) => student.id === id);
-  if (index !== -1 && (name && local[index].studentName !== name || className !== undefined && local[index].className !== className)) {
-    local[index] = { ...local[index], studentName: name || local[index].studentName, className: className ?? local[index].className };
-    localStorage.setItem(LS_LOCAL_DB, JSON.stringify(local));
-  }
-}
-
-/** تحديث اسم الطالب وفصله في الجلسة عند تعديل المعلم من جهاز آخر. */
-export async function refreshSessionDetails() {
-  const session = getSession();
-  if (!session) return;
-  try {
-    const res = await fetch(`/api/progress?id=${encodeURIComponent(session.id)}`, { cache: "no-store" });
-    if (!res.ok) return;
-    const data = await res.json();
-    applyCanonicalDetails(session.id, data);
-  } catch {}
-}
-
-/** تعديل الاسم فقط مع إبقاء الفصل وبقية بيانات الطالب في Neon كما هي. */
-export async function renameStudent(id: string, name: string): Promise<string> {
-  const normalized = name.replace(/\s+/g, " ").trim();
-  if (normalized.length < 3 || normalized.length > 100) throw new Error("الاسم يجب أن يكون بين ٣ و١٠٠ حرف");
-  const res = await fetch(`/api/progress?id=${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ studentName: normalized }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok || typeof data.studentName !== "string") {
-    throw new Error(data.error || "تعذر حفظ الاسم في قاعدة Neon. تحقق من الاتصال وأعد المحاولة.");
-  }
-  applyCanonicalDetails(id, data);
-  return data.studentName;
 }
 
 export function clearLocal() {
@@ -231,22 +184,15 @@ export function clearLocal() {
 }
 
 /* ============ جلب بيانات لوحة المعلم ============ */
-export async function fetchStudents(): Promise<{ students: StudentProgress[]; source: "neon" | "local"; error?: string }> {
+export async function fetchStudents(): Promise<{ students: StudentProgress[]; source: "neon" | "local" }> {
   try {
-    const res = await fetch("/api/progress", { cache: "no-store" });
-    let data: any;
-    try {
-      data = await res.json();
-    } catch {
-      throw new Error("واجهة /api/progress لا تُرجع JSON. تحقق من نشر دوال Vercel الخاصة بالمشروع.");
-    }
-    if (!res.ok || !data.ok || !Array.isArray(data.students)) {
-      throw new Error(data.error || `تعذر جلب بيانات Neon (رمز HTTP ${res.status}).`);
-    }
-    const students: StudentProgress[] = data.students.map((r: any) => ({
+    const res = await fetch("/api/progress");
+    if (!res.ok) throw new Error();
+    const data = await res.json();
+    const students: StudentProgress[] = (data.students || []).map((r: any) => ({
       id: r.id,
       studentName: r.student_name,
-      className: normalizeClassName(r.class_name),
+      className: r.class_name || "",
       maxSlide: r.max_slide ?? 0,
       totalSlides: r.total_slides ?? 14,
       quizScore: r.quiz_score,
@@ -256,92 +202,78 @@ export async function fetchStudents(): Promise<{ students: StudentProgress[]; so
       updatedAt: r.updated_at,
     }));
     return { students, source: "neon" };
-  } catch (error) {
-    return {
-      students: readLocal().sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)),
-      source: "local",
-      error: error instanceof Error ? error.message : "تعذر الوصول إلى قاعدة Neon.",
-    };
+  } catch {
+    return { students: readLocal().sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)), source: "local" };
   }
 }
 
-/** إعادة تسمية الفصل في القاعدة بعد نجاح القراءة، دون حجب سجلات الطلاب إن فشلت. */
-export async function migrateLegacyClasses(): Promise<number> {
-  const res = await fetch("/api/progress?migrateClasses=1", { method: "POST" });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok) throw new Error(data.error || "تعذر تحديث تسميات الفصول في Neon");
-  return Number(data.updated) || 0;
-}
+/**
+ * تعديل اسم الطالب (وفصله) من لوحة المعلم — مع الحفاظ على كل بياناته السابقة.
+ * السجل يبقى بنفس الـ id، فتُحفظikawa الدرجة والأنشطة والتقدم كما هي.
+ */
+export async function renameStudent(
+  id: string,
+  studentName: string,
+  className?: string
+): Promise<{ ok: boolean; synced: boolean }> {
+  const all = readLocal();
+  const idx = all.findIndex((x) => x.id === id);
+  const current = idx >= 0 ? all[idx] : null;
 
-/** نسخة احتياطية تشمل سجلات Neon وأي سجلات أقدم لم تُرفع من هذا الجهاز. */
-export function makeBackup(students: StudentProgress[]) {
-  const ids = new Set(students.map((student) => student.id));
-  const localOnly = readLocal().filter((student) => !ids.has(student.id));
-  return JSON.stringify({ version: 1, lessonSlug: "saudi-state-2", exportedAt: new Date().toISOString(), students: [...students, ...localOnly] }, null, 2);
-}
-
-export function localOnlyStudents(students: StudentProgress[]) {
-  const ids = new Set(students.map((student) => student.id));
-  return readLocal().filter((student) => !ids.has(student.id));
-}
-
-/** استعادة السجلات غير الموجودة فقط حتى لا تستبدل النسخة القديمة عمل الطلاب الجديد. */
-export async function restoreMissingStudents(records: StudentProgress[], existingIds: string[]) {
-  const known = new Set(existingIds);
-  let restored = 0;
-  let skipped = 0;
-  let failed = 0;
-  const missing = records.filter((student) => {
-    if (known.has(student.id)) return false;
-    known.add(student.id);
-    return true;
-  });
-  for (let i = 0; i < missing.length; i += 3) {
-    const results = await Promise.all(missing.slice(i, i + 3).map(async (student) => {
-      try {
-        const res = await fetch("/api/progress?restore=1", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(student),
-        });
-        const data = await res.json();
-        return res.ok && data.ok ? (data.created ? "restored" : "skipped") : "failed";
-      } catch { return "failed"; }
-    }));
-    restored += results.filter((result) => result === "restored").length;
-    skipped += results.filter((result) => result === "skipped").length;
-    failed += results.filter((result) => result === "failed").length;
-  }
-  return { restored, skipped, failed };
-}
-
-export function parseBackup(text: string): StudentProgress[] {
-  let backup: any;
-  try { backup = JSON.parse(text); } catch { throw new Error("الملف ليس نسخة احتياطية صالحة"); }
-  if (backup?.lessonSlug !== "saudi-state-2" || !Array.isArray(backup.students) || backup.students.length > 2000) {
-    throw new Error("النسخة الاحتياطية غير صالحة لهذا الدرس أو تحتوي على عدد كبير جداً من السجلات");
-  }
-  return backup.students.map((raw: any) => {
-    const id = typeof raw?.id === "string" ? raw.id.trim() : "";
-    const studentName = typeof raw?.studentName === "string" ? raw.studentName.replace(/\s+/g, " ").trim() : "";
-    if (!id || id.length > 120 || studentName.length < 3 || studentName.length > 100) {
-      throw new Error("النسخة تحتوي على سجل طالب غير صالح");
-    }
-    const validDate = (value: unknown) => typeof value === "string" && !Number.isNaN(Date.parse(value)) ? value : new Date().toISOString();
-    const numberOrNull = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-    return {
-      id,
+  // تحديث النسخة المحلية دائماً (تظهر فوراً في اللوحة)
+  if (current) {
+    const updated: StudentProgress = {
+      ...current,
       studentName,
-      className: normalizeClassName(raw.className),
-      maxSlide: numberOrNull(raw.maxSlide) ?? 0,
-      totalSlides: numberOrNull(raw.totalSlides) || 14,
-      quizScore: numberOrNull(raw.quizScore),
-      quizTotal: numberOrNull(raw.quizTotal),
-      activities: raw.activities && typeof raw.activities === "object" && !Array.isArray(raw.activities) ? raw.activities : {},
-      startedAt: validDate(raw.startedAt),
-      updatedAt: validDate(raw.updatedAt),
-    } satisfies StudentProgress;
-  });
+      className: className ?? current.className,
+      updatedAt: new Date().toISOString(),
+    };
+    const copy = [...all];
+    copy[idx] = updated;
+    try {
+      localStorage.setItem(LS_LOCAL_DB, JSON.stringify(copy));
+    } catch {}
+    saveLocal(updated);
+  }
+
+  // إذا كان الاسم الجديد يخص الجلسة المفتوحة على هذا الجهاز
+  const sess = getSession();
+  if (sess && sess.id === id) {
+    const updatedSession: StudentProgress = {
+      ...sess,
+      studentName,
+      className: className ?? sess.className,
+      updatedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(LS_SESSION, JSON.stringify(updatedSession));
+  }
+
+  try {
+    const map = JSON.parse(localStorage.getItem(LS_RENAMED) || "{}");
+    map[id] = true;
+    localStorage.setItem(LS_RENAMED, JSON.stringify(map));
+  } catch {}
+
+  // مزامنة مع قاعدة البيانات
+  try {
+    const res = await fetch(`/api/progress?id=${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ studentName, className }),
+    });
+    return { ok: res.ok, synced: res.ok };
+  } catch {
+    return { ok: true, synced: false };
+  }
+}
+
+/** تعديل الفصل فقط — لا يغيّر الاسم المعتمد من المعلم ولا أي بيانات أخرى */
+export async function changeStudentClass(id: string, className: string): Promise<boolean> {
+  const current = readLocal().find((x) => x.id === id) ?? (getSession()?.id === id ? getSession() : null);
+  const name = current?.studentName;
+  if (!name) return false;
+  const r = await renameStudent(id, name, className);
+  return r.ok;
 }
 
 /** حذف طالب واحد من قاعدة البيانات ومن التخزين المحلي */
@@ -355,7 +287,6 @@ export async function deleteStudent(id: string): Promise<boolean> {
   }
   try {
     localStorage.setItem(LS_LOCAL_DB, JSON.stringify(readLocal().filter((s) => s.id !== id)));
-    localStorage.removeItem(pendingKey(id));
   } catch {}
   // إذا كان المحذوف هو جلسة هذا الجهاز نُنهيها حتى لا يُعاد إنشاؤه تلقائياً
   if (getSession()?.id === id) {

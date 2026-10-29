@@ -2,31 +2,29 @@
  * مخزن الأصوات المخصصة للمعلم.
  * - يُحفظ الملف محلياً (IndexedDB) لتشغيل فوري وسريع.
  * - ويُرفع إلى Neon عبر /api/sounds ليُتاح على جميع الأجهزة.
- * - الملفات السحابية تُشغّل مباشرة من رابط النسخة، وتُحمّل مسبقاً للشريحة القادمة.
+ * - عند التشغيل: نحاول المحلي، فإن لم يوجد نجلبه من السحابة ونخزّنه محلياً.
  */
 
 const DB_NAME = "lesson2_sounds";
 const STORE = "files";
+const URL_STORE = "urls";
 export const MAX_SOUND_BYTES = 4 * 1024 * 1024;
 
 /* ================= IndexedDB ================= */
-let dbPromise: Promise<IDBDatabase> | null = null;
 function openDB(): Promise<IDBDatabase> {
-  if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, 1);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+      if (!db.objectStoreNames.contains(URL_STORE)) db.createObjectStore(URL_STORE);
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
-  dbPromise.catch(() => { dbPromise = null; });
-  return dbPromise;
 }
 
-async function dbPut(key: string, blob: Blob, invalidate = true) {
+async function dbPut(key: string, blob: Blob) {
   const db = await openDB();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
@@ -34,7 +32,9 @@ async function dbPut(key: string, blob: Blob, invalidate = true) {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
-  if (invalidate) dropCachedURL(key);
+  const old = cache.get(key);
+  if (old) URL.revokeObjectURL(old);
+  cache.delete(key);
 }
 
 async function dbDelete(key: string) {
@@ -45,7 +45,9 @@ async function dbDelete(key: string) {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
-  dropCachedURL(key);
+  const url = cache.get(key);
+  if (url) URL.revokeObjectURL(url);
+  cache.delete(key);
 }
 
 async function dbGet(key: string): Promise<Blob | null> {
@@ -78,18 +80,10 @@ export async function listSoundKeys(): Promise<string[]> {
 
 /* ================= الحالة ================= */
 const cache = new Map<string, string>();
-function dropCachedURL(key: string) {
-  const url = cache.get(key);
-  if (url) URL.revokeObjectURL(url);
-  cache.delete(key);
-}
 let remoteKeys = new Set<string>();
 let localKeys = new Set<string>();
 let availableKeys = new Set<string>();
 let cloudOnline = false;
-let localLoaded = false;
-let listLoaded = false;
-let refreshPending: Promise<{ cloud: boolean; count: number }> | null = null;
 let lastError = "";
 let maxBytes = MAX_SOUND_BYTES;
 const remoteVersions = new Map<string, string>();
@@ -134,54 +128,38 @@ export const getMaxBytes = () => maxBytes;
 export const listRemoteKeys = () => Array.from(remoteKeys);
 
 /* ================= جلب القائمة من السحابة ================= */
-export function refreshKeys(): Promise<{ cloud: boolean; count: number }> {
-  if (refreshPending) return refreshPending;
-  refreshPending = (async () => {
-    if (!localLoaded) {
-      localKeys = new Set(await listSoundKeys());
-      localLoaded = true;
-    }
-    try {
-      const res = await fetch("/api/sounds", {
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-      });
-      if (!res.ok) throw new Error();
-      const data = await res.json();
-      if (!Array.isArray(data.sounds)) throw new Error();
-      const newKeys = new Set<string>(data.sounds.map((item: { key: string }) => String(item.key)));
-
-      // حذف النسخ المحلية للأصوات التي حُذفت أو استُبدلت على جهاز آخر.
-      for (const key of remoteKeys) {
-        if (!newKeys.has(key) && localKeys.has(key)) {
-          await dbDelete(key);
-          localKeys.delete(key);
+export async function refreshKeys(): Promise<{ cloud: boolean; count: number }> {
+  localKeys = new Set(await listSoundKeys());
+  try {
+    const res = await fetch("/api/sounds", { headers: { Accept: "application/json" } });
+    if (!res.ok) throw new Error();
+    const data = await res.json();
+    const list = data.sounds || [];
+    remoteKeys = new Set<string>(list.map((s: any) => String(s.key)));
+    // عند استبدال ملف على جهاز آخر: احذف النسخة المحلية القديمة ليُجلب الجديد
+    for (const item of list) {
+      const k = String(item.key);
+      const v = String(item.updatedAt || item.updated_at || "");
+      remoteVersions.set(k, v);
+      if (v && v !== getSavedVersion(k)) {
+        if (localKeys.has(k)) {
+          await dbDelete(k);
+          localKeys.delete(k);
         }
+        const old = cache.get(k);
+        if (old) URL.revokeObjectURL(old);
+        cache.delete(k);
+        saveVersion(k, v);
       }
-      for (const item of data.sounds) {
-        const key = String(item.key);
-        const version = String(item.updatedAt || item.updated_at || "");
-        if (version && version !== getSavedVersion(key)) {
-          if (localKeys.has(key)) {
-            await dbDelete(key);
-            localKeys.delete(key);
-          }
-          saveVersion(key, version);
-        }
-        remoteVersions.set(key, version);
-      }
-      remoteKeys = newKeys;
-      if (typeof data.maxBytes === "number" && data.maxBytes > 0) maxBytes = data.maxBytes;
-      cloudOnline = true;
-    } catch {
-      cloudOnline = false;
     }
-    listLoaded = true;
-    availableKeys = new Set([...localKeys, ...remoteKeys]);
-    notify();
-    return { cloud: cloudOnline, count: remoteKeys.size };
-  })().finally(() => { refreshPending = null; });
-  return refreshPending;
+    if (typeof data.maxBytes === "number" && data.maxBytes > 0) maxBytes = data.maxBytes;
+    cloudOnline = true;
+  } catch {
+    cloudOnline = false;
+  }
+  availableKeys = new Set([...localKeys, ...remoteKeys]);
+  notify();
+  return { cloud: cloudOnline, count: remoteKeys.size };
 }
 
 /* ================= الرفع / الحذف ================= */
@@ -196,7 +174,6 @@ export async function putSound(key: string, blob: Blob): Promise<{ synced: boole
 
   // ١) حفظ محلي فوري
   await dbPut(key, blob);
-  cache.set(key, URL.createObjectURL(blob));
   localKeys.add(key);
   availableKeys.add(key);
 
@@ -267,13 +244,7 @@ export async function syncLocalToCloud(): Promise<{ uploaded: number; failed: nu
         body: blob,
       });
       if (!res.ok) throw new Error();
-      const data = await res.json();
       remoteKeys.add(key);
-      if (data.updatedAt) {
-        const version = String(data.updatedAt);
-        remoteVersions.set(key, version);
-        saveVersion(key, version);
-      }
       uploaded++;
     } catch {
       failed++;
@@ -284,74 +255,93 @@ export async function syncLocalToCloud(): Promise<{ uploaded: number; failed: nu
   return { uploaded, failed };
 }
 
-/* ================= بث الصوت وتهيئته ================= */
-function remoteURL(key: string) {
-  const version = remoteVersions.get(key);
-  const params = new URLSearchParams({ key });
-  if (version) params.set("v", version);
-  return `/api/sounds?${params.toString()}`;
-}
+/* ================= تشغيل الصوت ================= */
+export async function getSoundURL(key: string, forceRemote = false): Promise<string | null> {
+  if (!forceRemote && cache.has(key)) return cache.get(key)!;
 
-/** رابط جاهز فوراً للمشغّل، دون انتظار تنزيل الملف كاملاً. */
-export function getReadySoundURL(key: string): string | null {
-  return cache.get(key) || (remoteKeys.has(key) && cloudOnline ? remoteURL(key) : null);
-}
-
-export async function getSoundURL(key: string): Promise<string | null> {
-  if (cache.has(key)) return cache.get(key)!;
-  if (localKeys.has(key)) {
-    const blob = await dbGet(key);
-    if (blob) {
-      const url = URL.createObjectURL(blob);
+  if (!forceRemote) {
+    const local = await dbGet(key);
+    if (local) {
+      const url = URL.createObjectURL(local);
       cache.set(key, url);
       return url;
     }
   }
 
-  if (remoteKeys.has(key) && cloudOnline) return remoteURL(key);
-
-  // ينتظر قائمة المفاتيح مرة واحدة فقط، ثم يفتح رابط الملف المباشر.
-  if (!listLoaded) await refreshKeys();
-  return getReadySoundURL(key);
+  try {
+    const version = remoteVersions.get(key) || getSavedVersion(key) || "";
+    const res = await fetch(
+      `/api/sounds?key=${encodeURIComponent(key)}${version ? `&v=${encodeURIComponent(version)}` : ""}`,
+      { cache: version ? "default" : "no-store" }
+    );
+    if (res.status === 304) {
+      // الملف موجود محلياً(matching) — نعيد رابطه
+      const cached = await dbGet(key);
+      if (cached) {
+        const url = URL.createObjectURL(cached);
+        cache.set(key, url);
+        return url;
+      }
+      return null;
+    }
+    if (!res.ok) return null;
+    const type = res.headers.get("content-type") || "";
+    // في التشغيل المحلي بدون API قد يرجع index.html — لا نعتبره صوتاً
+    if (!type.startsWith("audio/") && !type.includes("octet-stream")) return null;
+    const blob = await res.blob();
+    if (!blob.size) return null;
+    const url = URL.createObjectURL(blob);
+    cache.set(key, url);
+    // لا نخزّن نسخة محلية (لتوفير المساحة) — الرابط يبقى في الذاكرة للصفحة الحالية
+    return url;
+  } catch {
+    return null;
+  }
 }
 
-let warmController: AbortController | null = null;
+/** تشغيل ملف صوتي مخصص (يعيد false إذا لم يوجد) */
+export async function playCustom(
+  key: string,
+  onEnd?: () => void,
+  opts: { exclusive?: boolean; volume?: number } = {}
+): Promise<boolean> {
+  const { exclusive = true, volume = 1 } = opts;
+  const url = await getSoundURL(key);
+  if (!url) {
+    onEnd?.();
+    return false;
+  }
+  if (exclusive) {
+    // إيقاف أي صوت جارٍ قبل تشغيل الجديد
+    const { stopAllSounds } = await import("./audio");
+    stopAllSounds();
+  }
+  const audio = new Audio(url);
+  audio.volume = volume;
+  audio.preload = "auto";
+  audio.onended = () => onEnd?.();
+  audio.onerror = () => onEnd?.();
+  void audio.play().catch(() => onEnd?.());
+  return true;
+}
 
-/** تهيئة صوت الشريحة الحالية والتالية في الخلفية بدون حجب زر التشغيل. */
-export function warmSounds(keys: string[]) {
-  warmController?.abort();
-  const controller = new AbortController();
-  warmController = controller;
-  void (async () => {
-    await refreshKeys();
-    for (const key of keys) {
-      if (controller.signal.aborted) return;
-      if (cache.has(key)) continue;
-      if (localKeys.has(key)) {
-        await getSoundURL(key);
-        continue;
-      }
-      if (!remoteKeys.has(key)) continue;
-      const version = remoteVersions.get(key);
+/** تحميل مسبق لروابط الملفات السحابية لتسريع أول تشغيل */
+export async function preloadRemoteSounds(): Promise<number> {
+  await refreshKeys();
+  const keys = Array.from(remoteKeys);
+  await Promise.all(
+    keys.map(async (k) => {
       try {
-        // fetch دون Range لتُخزَّن النسخة في CDN ثم في المتصفح.
-        const res = await fetch(remoteURL(key), { signal: controller.signal });
-        if (!res.ok || !(res.headers.get("content-type") || "").startsWith("audio/")) continue;
-        const blob = await res.blob();
-        if (!blob.size || controller.signal.aborted || !remoteKeys.has(key) || remoteVersions.get(key) !== version) continue;
-        await dbPut(key, blob, false);
-        if (controller.signal.aborted || remoteVersions.get(key) !== version) {
-          await dbDelete(key);
-          continue;
-        }
-        cache.set(key, URL.createObjectURL(blob));
-        localKeys.add(key);
-        availableKeys.add(key);
-      } catch {
-        // فشل التهيئة لا يمنع التشغيل؛ يبقى رابط البث المباشر متاحاً.
-      }
-    }
-  })();
+        await getSoundURL(k, true);
+      } catch {}
+    })
+  );
+  return keys.length;
+}
+
+/** صمت->هادئ: تسريب الصوت بدون كاش */
+export function primeSound(key: string) {
+  void getSoundURL(key, true).catch(() => {});
 }
 
 // تحميل القائمة عند بدء التطبيق ليعرف المتصفح الأصوات المتاحة سحابياً

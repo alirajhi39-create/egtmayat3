@@ -90,7 +90,7 @@ export function PrintReport({
               <tr key={s.id} className={`avoid-break ${i % 2 ? "bg-slate-50" : "bg-white"}`}>
                 <td className="border border-slate-300 px-2 py-1.5 font-bold text-center">{i + 1}</td>
                 <td className="border border-slate-300 px-2 py-1.5 font-extrabold">{s.studentName}</td>
-                <td dir="ltr" className="border border-slate-300 px-2 py-1.5 text-center font-bold">{s.className || "—"}</td>
+                <td className="border border-slate-300 px-2 py-1.5 text-center font-bold">{s.className || "—"}</td>
                 <td className="border border-slate-300 px-2 py-1.5">
                   <div className="flex items-center gap-2">
                     <div className="h-2.5 flex-1 bg-slate-200 rounded-full overflow-hidden">
@@ -136,7 +136,7 @@ export function PrintReport({
             return (
               <div key={s.id} className="avoid-break rounded-lg border-2 border-slate-200 p-3 mb-3">
                 <p className="font-black text-teal-900 mb-2">
-                  👤 {s.studentName} <span className="text-slate-500 font-bold text-[11px]">— الفصل <bdi dir="ltr">{s.className || "—"}</bdi></span>
+                  👤 {s.studentName} <span className="text-slate-500 font-bold text-[11px]">— الفصل {s.className || "—"}</span>
                 </p>
                 {nothing ? (
                   <p className="text-slate-400 font-bold text-[11px]">لم يسجّل الطالب أي إجابة بعد.</p>

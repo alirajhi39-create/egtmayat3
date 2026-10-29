@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { createSession, findLocalStudent } from "../lib/progress";
-import { CLASSES, type ClassName } from "../lib/classes";
+import { createSession } from "../lib/progress";
 import { playSuccess, playClick } from "../utils/audio";
+
+const CLASSES = ["٦/١", "٦/٢"];
 
 export function StudentLogin({ onStart, onTeacher }: { onStart: () => void; onTeacher: () => void }) {
   const [name, setName] = useState("");
-  const [cls, setCls] = useState<ClassName>(CLASSES[0]);
+  const [cls, setCls] = useState(CLASSES[0]);
   const [error, setError] = useState("");
 
   const start = () => {
@@ -13,12 +14,8 @@ export function StudentLogin({ onStart, onTeacher }: { onStart: () => void; onTe
       setError("فضلاً اكتب اسمك الثلاثي بشكل صحيح");
       return;
     }
-    const previous = findLocalStudent(name.trim(), cls);
-    const resume = previous ? window.confirm(
-      "وُجد تقدم سابق لهذا الطالب على هذا الجهاز. اضغط موافق لاستكماله مع الاحتفاظ بالإجابات والدرجات، أو إلغاء للبدء بسجل جديد. لن يُحذف السجل السابق."
-    ) : false;
     playSuccess();
-    createSession(name.trim(), cls, 14, resume);
+    createSession(name.trim(), cls, 14);
     onStart();
   };
 
@@ -64,7 +61,7 @@ export function StudentLogin({ onStart, onTeacher }: { onStart: () => void; onTe
                 cls === c ? "bg-teal-700 border-teal-700 text-white" : "bg-white border-slate-300 text-slate-600 hover:border-teal-400"
               }`}
             >
-              <bdi dir="ltr">{c}</bdi>
+              {c}
             </button>
           ))}
         </div>
