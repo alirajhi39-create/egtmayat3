@@ -35,19 +35,34 @@ export function getSession(): StudentProgress | null {
   }
 }
 
-export function createSession(studentName: string, className: string, totalSlides: number): StudentProgress {
+/** البحث عن عمل الطالب المحفوظ على هذا الجهاز، حتى لو كان من إصدار قديم للتطبيق. */
+export function findLocalStudent(studentName: string, className: string): StudentProgress | null {
+  const name = studentName.replace(/\s+/g, " ").trim();
+  const selectedClass = normalizeClassName(className);
+  const sameName = readLocal().filter((student) => student.studentName.replace(/\s+/g, " ").trim() === name);
+  const sameClass = sameName.filter((student) => student.className === selectedClass);
+  if (sameClass.length) {
+    return sameClass.sort((a, b) => b.maxSlide - a.maxSlide || Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+  }
+  // قد يكون المعلم نقل الطالب لفصل آخر أثناء انقطاع جهاز الطالب عن الإنترنت.
+  return sameName.length === 1 ? sameName[0] : null;
+}
+
+export function createSession(studentName: string, className: string, totalSlides: number, resumeLocal = false): StudentProgress {
   const existing = getSession();
-  const sameStudent = existing?.studentName === studentName;
+  const name = studentName.replace(/\s+/g, " ").trim();
+  const sameStudent = existing?.studentName === name;
+  const previous = sameStudent ? existing : resumeLocal ? findLocalStudent(name, className) : null;
   const session: StudentProgress = {
-    id: sameStudent ? existing.id : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    studentName,
+    id: previous?.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    studentName: previous?.studentName || name,
     className: normalizeClassName(className),
-    maxSlide: sameStudent ? existing.maxSlide : 0,
+    maxSlide: previous?.maxSlide ?? 0,
     totalSlides,
-    quizScore: sameStudent ? existing.quizScore : null,
-    quizTotal: sameStudent ? existing.quizTotal : null,
-    activities: sameStudent ? existing.activities : {},
-    startedAt: sameStudent ? existing.startedAt : new Date().toISOString(),
+    quizScore: previous?.quizScore ?? null,
+    quizTotal: previous?.quizTotal ?? null,
+    activities: previous?.activities ?? {},
+    startedAt: previous?.startedAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   localStorage.setItem(LS_SESSION, JSON.stringify(session));

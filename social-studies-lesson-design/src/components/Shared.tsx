@@ -1,6 +1,6 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
 import { speak, stopSpeaking, playClick } from "../utils/audio";
-import { recordActivity } from "../lib/progress";
+import { getSession, recordActivity } from "../lib/progress";
 
 /** سياق يحمل رقم الشريحة الحالية لربط ملفات التعليق الصوتي بها */
 export const SlideContext = createContext(0);
@@ -15,12 +15,14 @@ export const narrationKey = (slide: number, variant?: string) =>
  * في قاعدة البيانات / التخزين المحلي ليراها المعلم.
  */
 export function useActivityAnswer(key: string, initial = "") {
-  const [value, setValue] = useState(initial);
-  const t = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [value, setValue] = useState(() => {
+    const saved = getSession()?.activities?.[key];
+    return typeof saved === "string" ? saved : initial;
+  });
   const set = (v: string) => {
     setValue(v);
-    if (t.current) clearTimeout(t.current);
-    t.current = setTimeout(() => recordActivity(key, v), 600);
+    // يُحفظ محلياً فور الكتابة؛ طبقة التقدم تجمع طلبات الشبكة بنفسها.
+    recordActivity(key, v);
   };
   return [value, set] as const;
 }

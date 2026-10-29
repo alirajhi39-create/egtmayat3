@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { createSession } from "../lib/progress";
+import { createSession, findLocalStudent } from "../lib/progress";
 import { CLASSES, type ClassName } from "../lib/classes";
 import { playSuccess, playClick } from "../utils/audio";
 
@@ -13,8 +13,12 @@ export function StudentLogin({ onStart, onTeacher }: { onStart: () => void; onTe
       setError("فضلاً اكتب اسمك الثلاثي بشكل صحيح");
       return;
     }
+    const previous = findLocalStudent(name.trim(), cls);
+    const resume = previous ? window.confirm(
+      "وُجد تقدم سابق لهذا الطالب على هذا الجهاز. اضغط موافق لاستكماله مع الاحتفاظ بالإجابات والدرجات، أو إلغاء للبدء بسجل جديد. لن يُحذف السجل السابق."
+    ) : false;
     playSuccess();
-    createSession(name.trim(), cls, 14);
+    createSession(name.trim(), cls, 14, resume);
     onStart();
   };
 

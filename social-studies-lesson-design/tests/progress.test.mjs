@@ -161,6 +161,16 @@ test("backup restores only missing IDs and updates the student session name", as
   assert.equal(posted.length, 1);
   assert.deepEqual(posted[0].activities, { "نشاط١": "محفوظ" });
 
+  const previous = progress.findLocalStudent("طالب محلي", "6 / أ");
+  assert.equal(previous.id, "local");
+  assert.equal(progress.findLocalStudent("طالب محلي", "6 / ب")?.id, "local", "the teacher may have changed the class while the device was offline");
+  const resumed = progress.createSession("طالب محلي", "6 / أ", 14, true);
+  assert.equal(resumed.id, "local");
+  assert.equal(resumed.maxSlide, 8);
+  assert.equal(resumed.quizScore, 6);
+  assert.deepEqual(resumed.activities, { "نشاط١": "محفوظ" });
+  assert.equal(resumed.startedAt, "2025-01-01T10:00:00Z");
+
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, studentName: "الاسم الذي عدله المعلم", className: "6 / ب" }) });
   const session = progress.createSession("اسم الطالب الأول", "٦/١", 14);
   await new Promise((resolve) => setTimeout(resolve, 0));

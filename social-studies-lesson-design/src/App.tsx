@@ -107,7 +107,13 @@ export default function App() {
   if (view === "login")
     return (
       <StudentLogin
-        onStart={() => { setStudent(getSession()); setSlide(0); setFinished(false); setView("lesson"); }}
+        onStart={() => {
+          const session = getSession();
+          setStudent(session);
+          setSlide(session?.maxSlide ?? 0);
+          setFinished(false);
+          setView("lesson");
+        }}
         onTeacher={() => { stopAllAudio(); setView("teacher"); }}
       />
     );
