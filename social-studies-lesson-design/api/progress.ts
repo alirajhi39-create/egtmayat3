@@ -1,5 +1,5 @@
 import { neon } from "@neondatabase/serverless";
-import { isClassName, normalizeClassName } from "../src/lib/classes";
+import { normalizeClassName } from "../src/lib/classes";
 
 /**
  * واجهة برمجية واحدة لإدارة تقدم الطلاب.
@@ -31,18 +31,19 @@ function ensureTable(sql: any) {
           updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
         );
       `;
-      // تغيير تسمية الفصول القديمة فقط، من دون مساس بالدرجات أو الإجابات أو التواريخ.
+      // إرجاع تسميات الفصل إلى ٦/١ و٦/٢. لا يتغير أي حقل آخر في سجلات الطلاب.
       await sql`
         UPDATE lesson_progress
         SET class_name = CASE
-          WHEN replace(class_name, ' ', '') IN ('٦/١', '6/1', '٦/1', '6/١', '٦/أ', '6/أ', '٦/ا', '6/ا')
-            THEN '6 / أ'
-          ELSE '6 / ب'
+          WHEN replace(class_name, ' ', '') IN ('6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١')
+            THEN '٦/١'
+          ELSE '٦/٢'
         END
         WHERE lesson_slug = 'saudi-state-2'
+          AND class_name NOT IN ('٦/١', '٦/٢')
           AND replace(class_name, ' ', '') IN (
-            '٦/١', '6/1', '٦/1', '6/١', '٦/أ', '6/أ', '٦/ا', '6/ا',
-            '٦/٢', '6/2', '٦/2', '6/٢', '٦/ب', '6/ب'
+            '6/أ', '٦/أ', '6/ا', '٦/ا', '6/1', '٦/1', '6/١', '٦/١',
+            '6/ب', '٦/ب', '6/2', '٦/2', '6/٢', '٦/٢'
           );
       `;
     })().catch((error) => {
@@ -103,7 +104,7 @@ export default async function handler(req: any, res: any) {
         return res.status(200).json({ ok: true, created: inserted.length > 0 });
       }
 
-      // لا يغيّر حفظ التقدم الاسم أو الفصل المعتمدين من المعلم في سجل موجود.
+      // لا يغيّر حفظ التقدم الاسم أو الفصل في سجل موجود حتى مع جهاز يستخدم الإصدار الأقدم.
       const saved = await sql`
         INSERT INTO lesson_progress
           (id, student_name, class_name, lesson_slug, max_slide, total_slides, quiz_score, quiz_total, activities, started_at, updated_at)
@@ -127,30 +128,21 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    /* ===== تعديل المعلم لاسم الطالب أو فصله دون تغيير تقدمه ===== */
+    /* ===== تعديل اسم الطالب فقط دون تغيير فصله أو تقدمه ===== */
     if (req.method === "PATCH") {
       const id = typeof req.query?.id === "string" ? req.query.id.trim() : "";
       const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
-      const hasName = Object.prototype.hasOwnProperty.call(body, "studentName");
-      const hasClass = Object.prototype.hasOwnProperty.call(body, "className");
-      const studentName = hasName && typeof body.studentName === "string"
-        ? body.studentName.replace(/\s+/g, " ").trim() : null;
-      const className = hasClass ? normalizeClassName(body.className) : null;
-      if (!id || (!hasName && !hasClass)) {
-        return res.status(400).json({ ok: false, error: "حدد اسم الطالب أو فصله للتعديل" });
+      if (Object.prototype.hasOwnProperty.call(body, "className")) {
+        return res.status(400).json({ ok: false, error: "أُعيدت الفصول إلى ٦/١ و٦/٢؛ تعديل الفصل متوقف" });
       }
-      if (hasName && (!studentName || studentName.length < 3 || studentName.length > 100)) {
+      const studentName = typeof body.studentName === "string" ? body.studentName.replace(/\s+/g, " ").trim() : "";
+      if (!id || studentName.length < 3 || studentName.length > 100) {
         return res.status(400).json({ ok: false, error: "أدخل اسم الطالب الصحيح (٣ إلى ١٠٠ حرف)" });
-      }
-      if (hasClass && !isClassName(className)) {
-        return res.status(400).json({ ok: false, error: "اختر الفصل 6 / أ أو 6 / ب" });
       }
 
       const updated = await sql`
         UPDATE lesson_progress
-        SET student_name = COALESCE(${studentName}, student_name),
-            class_name = COALESCE(${className}, class_name),
-            updated_at = now()
+        SET student_name = ${studentName}, updated_at = now()
         WHERE id = ${id} AND lesson_slug = 'saudi-state-2'
         RETURNING student_name, class_name;
       `;

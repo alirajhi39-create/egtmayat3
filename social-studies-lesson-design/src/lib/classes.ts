@@ -1,4 +1,4 @@
-export const CLASSES = ["6 / أ", "6 / ب"] as const;
+export const CLASSES = ["٦/١", "٦/٢"] as const;
 export type ClassName = (typeof CLASSES)[number];
 
 export function normalizeClassName(value: unknown): string {

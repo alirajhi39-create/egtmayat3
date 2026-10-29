@@ -2,7 +2,7 @@
  * إدارة تقدم الطالب: يحفظ محلياً دائماً، ويزامن مع قاعدة بيانات Neon
  * عبر /api/progress إذا كانت متاحة (على Vercel).
  */
-import { isClassName, normalizeClassName } from "./classes";
+import { normalizeClassName } from "./classes";
 
 export type StudentProgress = {
   id: string;
@@ -166,36 +166,21 @@ export async function refreshSessionDetails() {
   } catch {}
 }
 
-/** تحديث بيانات السجل المحددة فقط؛ لا يتغير المعرف أو التقدم أو الإجابات. */
-export async function updateStudentDetails(id: string, details: { studentName?: string; className?: string }) {
-  const patch: { studentName?: string; className?: string } = {};
-  if (details.studentName !== undefined) {
-    const normalized = details.studentName.replace(/\s+/g, " ").trim();
-    if (normalized.length < 3 || normalized.length > 100) throw new Error("الاسم يجب أن يكون بين ٣ و١٠٠ حرف");
-    patch.studentName = normalized;
-  }
-  if (details.className !== undefined) {
-    const normalized = normalizeClassName(details.className);
-    if (!isClassName(normalized)) throw new Error("اختر الفصل 6 / أ أو 6 / ب");
-    patch.className = normalized;
-  }
-  if (!Object.keys(patch).length) throw new Error("حدد الاسم أو الفصل المراد تعديله");
+/** تعديل الاسم فقط مع إبقاء الفصل وبقية بيانات الطالب في Neon كما هي. */
+export async function renameStudent(id: string, name: string): Promise<string> {
+  const normalized = name.replace(/\s+/g, " ").trim();
+  if (normalized.length < 3 || normalized.length > 100) throw new Error("الاسم يجب أن يكون بين ٣ و١٠٠ حرف");
   const res = await fetch(`/api/progress?id=${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch),
+    body: JSON.stringify({ studentName: normalized }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok || typeof data.studentName !== "string") {
-    throw new Error(data.error || "تعذر حفظ بيانات الطالب في قاعدة Neon. تحقق من الاتصال وأعد المحاولة.");
+    throw new Error(data.error || "تعذر حفظ الاسم في قاعدة Neon. تحقق من الاتصال وأعد المحاولة.");
   }
   applyCanonicalDetails(id, data);
-  return { studentName: data.studentName as string, className: typeof data.className === "string" ? normalizeClassName(data.className) : undefined };
-}
-
-export async function renameStudent(id: string, name: string): Promise<string> {
-  const saved = await updateStudentDetails(id, { studentName: name });
-  return saved.studentName;
+  return data.studentName;
 }
 
 export function clearLocal() {
@@ -326,7 +311,7 @@ export async function deleteAllRemote() {
 
 /* ============ تصدير CSV ============ */
 export function toCSV(students: StudentProgress[]): string {
-  const headers = ["اسم الطالب", "الفصل", "الشرائح المنجزة", "نسبة التقدم", "درجة الاختبار", "آخر نشاط", "إجابات الأنشطة"];
+  const headers = ["اسم الطالب", "الصف", "الشرائح المنجزة", "نسبة التقدم", "درجة الاختبار", "آخر نشاط", "إجابات الأنشطة"];
   const lines = students.map((s) => {
     const pct = Math.round(((s.maxSlide + 1) / (s.totalSlides || 14)) * 100);
     const acts = Object.entries(s.activities || {})
